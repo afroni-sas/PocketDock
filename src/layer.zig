@@ -340,5 +340,13 @@ pub fn extract(gpa: std.mem.Allocator, io: std.Io, blob: []const u8, root: []con
         var d = std.compress.zstd.Decompress.init(input, window, opts);
         return ex.run(&d.reader);
     }
+    if (input.peek(6)) |head| {
+        if (std.mem.eql(u8, head, "\xfd7zXZ\x00")) {
+            const window = try gpa.alloc(u8, 1 << 18);
+            var d = try std.compress.xz.Decompress.init(input, gpa, window);
+            defer d.deinit();
+            return ex.run(&d.reader);
+        }
+    } else |_| {}
     return ex.run(input);
 }

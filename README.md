@@ -1,11 +1,14 @@
+<div align="center">
+
+<img src="docs/images/logo.svg" width="112" height="112" alt="PocketDock logo">
+
 # PocketDock
+
+</div>
 
 A container engine for Android that needs no root. It pulls ordinary Docker/OCI
 images from any registry and runs them on the phone, so an app written in any
 language runs unchanged. It is a single static binary with no dependencies.
-
-PocketDock is the engine of a self-hosted, Railway-style platform for Android.
-The control panel will be built on top of it.
 
 ## Install
 
@@ -113,7 +116,6 @@ Also:
   with `--network private` or `none`.
 - Guests resolve names through public DNS servers unless `POCKETDOCK_DNS` is set.
 - 32-bit images, and images for another CPU architecture, are not supported.
-- `pdock build` has no cache yet: every build runs all its steps.
 
 ## Building images
 
@@ -122,14 +124,25 @@ pdock build -t myapp --build-arg VERSION=1.2 .
 pdock run myapp
 ```
 
-Multi-stage builds, `RUN` (including `<<EOF` blocks), `COPY --from`, `ARG`,
-`ENV`, `WORKDIR`, `USER`, `CMD`, `ENTRYPOINT`, `EXPOSE`, `LABEL`, `SHELL` and
-`.dockerignore` are supported. `VOLUME`, `HEALTHCHECK`, `STOPSIGNAL` and
-`ONBUILD` are accepted and ignored. `ADD` does not yet fetch URLs or unpack
-archives; it fails with a message rather than doing something different.
+Every Dockerfile instruction is supported, including multi-stage builds,
+`RUN <<EOF` blocks, `COPY --from` and `.dockerignore`. `ADD` fetches URLs,
+optionally with `--checksum=sha256:...`, and unpacks local `.tar`, `.tar.gz`,
+`.tar.xz` and `.tar.zst` archives.
+
+Steps are cached: a `RUN`, `COPY` or `ADD` whose inputs have not changed is not
+run again, and a failed build resumes from its last good step. `--no-cache` runs
+everything again, and `pdock prune` deletes layers nothing uses any more.
 
 A built image only stores what it changed. Its base is shared, so building
 on the phone does not copy the image.
+
+### At run time
+
+- `VOLUME` paths get their own storage, seeded from the image, which survives
+  restarts and is deleted with the container.
+- `STOPSIGNAL` is what `pdock stop` sends.
+- `HEALTHCHECK` runs inside the container; `pdock ps` shows `healthy` or
+  `unhealthy`. The `--health-*` options of `run` override it.
 
 ## How the filesystem works
 
