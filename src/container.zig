@@ -558,9 +558,11 @@ pub const Manager = struct {
         const id = cfg.id;
         var state: State = .{ .shim_pid = linux.getpid(), .status = "running" };
 
+        // The tracer grows this list with the same allocator.
         var ports: std.ArrayList(tracer.PortMap) = .empty;
+        defer ports.deinit(self.gpa);
         for (cfg.ports) |p| {
-            try ports.append(self.a, .{ .container = p.container, .host = p.host, .fixed = true });
+            try ports.append(self.gpa, .{ .container = p.container, .host = p.host, .fixed = true });
         }
 
         const vfs = try self.makeVfs(cfg);

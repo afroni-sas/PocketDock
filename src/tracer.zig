@@ -792,6 +792,9 @@ pub const Tracer = struct {
         defer {
             for (self.held.items) |p| self.release(p);
             self.held.deinit(gpa);
+            self.tracees.deinit(gpa);
+            self.by_vpid.deinit(gpa);
+            self.zombies.deinit(gpa);
             if (net_dir_path) |p| sys.rmrf(p.slice()) catch {};
             if (self.ctl_fd >= 0) {
                 sys.close(self.ctl_fd);
