@@ -299,6 +299,36 @@ fn backoffMs(attempt: u32) u64 {
     return @min(@as(u64, 1000) << @intCast(@min(attempt, 5)), 15_000);
 }
 
+/// Downloads a plain URL to `dest`, for `ADD`.
+pub fn downloadUrl(gpa: Allocator, io: std.Io, url: []const u8, dest: []const u8) !void {
+    var http: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer http.deinit();
+    const uri = try std.Uri.parse(url);
+    var req = try http.request(.GET, uri, .{
+        .headers = .{
+            .accept_encoding = .omit,
+            .user_agent = .{ .override = "pocketdock/0.1" },
+        },
+    });
+    defer req.deinit();
+    try req.sendBodiless();
+    var head_buf: [16384]u8 = undefined;
+    var resp = try req.receiveHead(&head_buf);
+    if (resp.head.status != .ok) return error.DownloadFailed;
+
+    var p = try sys.Path.of(dest);
+    const fd = try sys.open(p.z(), sys.O_WRONLY | sys.O_CREAT | sys.O_TRUNC, 0o600);
+    defer sys.close(fd);
+    var transfer: [65536]u8 = undefined;
+    const rd = resp.reader(&transfer);
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const n = try rd.readSliceShort(&buf);
+        if (n == 0) return;
+        try sys.writeAll(fd, buf[0..n]);
+    }
+}
+
 fn mb(n: u64) f64 {
     return @as(f64, @floatFromInt(n)) / (1024 * 1024);
 }
