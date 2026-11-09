@@ -44,6 +44,15 @@ pub const NetMode = enum {
     none,
 };
 
+pub const HealthSpec = struct {
+    exec_path: [:0]const u8,
+    argv: []const [:0]const u8,
+    interval_ms: u64,
+    timeout_ms: u64,
+    start_ms: u64,
+    retries: u32,
+};
+
 pub const Spec = struct {
     vfs: *Vfs,
     exec_path: [:0]const u8,
@@ -67,6 +76,8 @@ pub const Spec = struct {
     /// Where `exec` and `stats` reach this tracer. Empty disables them.
     ctl_path: []const u8 = "",
     limits: quota.Limits = .{},
+    health: ?HealthSpec = null,
+    on_health: ?*const fn (ctx: ?*anyopaque, status: []const u8) void = null,
     stdout_fd: i32 = 1,
     stderr_fd: i32 = 2,
     stdin_fd: i32 = 0,
@@ -442,6 +453,12 @@ pub const Tracer = struct {
     debt_ms: i64 = 0,
     last_tick: i128 = 0,
     last_mem_check: i128 = 0,
+    health_tid: i32 = 0,
+    health_deadline: i128 = 0,
+    next_health: i128 = 0,
+    health_failures: u32 = 0,
+    started_at: i128 = 0,
+    health_status: []const u8 = "",
 
     fn procToReal(ctx: *anyopaque, v: i32) ?i32 {
         const self: *Tracer = @ptrCast(@alignCast(ctx));
@@ -857,12 +874,24 @@ pub const Tracer = struct {
         first.needs_options = true;
 
         installWake(.USR2);
-        const period_ms: u32 = if (spec.limits.cpus_milli > 0) 100 else if (spec.limits.memory > 0) 200 else 0;
+        const period_ms: u32 = if (spec.limits.cpus_milli > 0)
+            100
+        else if (spec.limits.memory > 0)
+            200
+        else if (spec.health != null)
+            500
+        else
+            0;
         if (period_ms > 0) {
             installWake(.ALRM);
             setTimer(period_ms);
         }
         self.last_tick = sys.monoNs();
+        if (spec.health) |h| {
+            self.started_at = self.last_tick;
+            self.next_health = self.last_tick + @as(i128, h.interval_ms) * std.time.ns_per_ms;
+            self.setHealth("starting");
+        }
 
         const opts: usize = PT.O.TRACESYSGOOD | PT.O.TRACEFORK | PT.O.TRACEVFORK |
             PT.O.TRACECLONE | PT.O.TRACEEXEC | PT.O.TRACESECCOMP | PT.O.EXITKILL;
@@ -891,6 +920,7 @@ pub const Tracer = struct {
                         }
                     }
                 }
+                if (tid == self.health_tid) self.healthResult(exitCode(status));
                 if (tid == self.main_tid) {
                     self.main_status = status;
                     self.killAll();
@@ -1126,7 +1156,76 @@ pub const Tracer = struct {
             self.checkMemory();
         }
         if (limits.cpus_milli > 0) self.throttle(now);
+        if (self.spec.health) |h| self.healthTick(now, h);
         self.last_tick = now;
+    }
+
+    fn setHealth(self: *Tracer, status: []const u8) void {
+        if (std.mem.eql(u8, self.health_status, status)) return;
+        self.health_status = status;
+        if (self.spec.on_health) |f| f(self.spec.ctx, status);
+    }
+
+    fn healthTick(self: *Tracer, now: i128, h: HealthSpec) void {
+        if (self.health_tid != 0) {
+            if (now > self.health_deadline) _ = linux.kill(self.health_tid, .KILL);
+            return;
+        }
+        if (now < self.next_health) return;
+        self.startHealthCheck(now, h) catch self.healthResult(1);
+    }
+
+    /// Runs the check inside the container, like `exec` does.
+    fn startHealthCheck(self: *Tracer, now: i128, h: HealthSpec) !void {
+        const gpa = self.gpa;
+        const spec = self.spec;
+        const argv_z = try gpa.alloc(?[*:0]const u8, h.argv.len + 1);
+        defer gpa.free(argv_z);
+        for (h.argv, 0..) |a, k| argv_z[k] = a.ptr;
+        argv_z[h.argv.len] = null;
+        const envp_z = try gpa.alloc(?[*:0]const u8, spec.envp.len + 1);
+        defer gpa.free(envp_z);
+        for (spec.envp, 0..) |a, k| envp_z[k] = a.ptr;
+        envp_z[spec.envp.len] = null;
+
+        const devnull = try sys.open("/dev/null", sys.O_RDWR, 0);
+        defer sys.close(devnull);
+        const pid = try sys.fork();
+        if (pid == 0) {
+            self.childMain(.{
+                .exec_path = h.exec_path.ptr,
+                .argv = argv_z,
+                .envp = envp_z,
+                .stdin_fd = devnull,
+                .stdout_fd = devnull,
+                .stderr_fd = devnull,
+                .new_session = true,
+            });
+        }
+        const t = try self.getOrAdd(pid);
+        const p = try self.newProc(pid, null);
+        try p.exe.set(h.exec_path);
+        t.proc = p;
+        t.expect_stop = true;
+        t.needs_options = true;
+        self.health_tid = pid;
+        self.health_deadline = now + @as(i128, h.timeout_ms) * std.time.ns_per_ms;
+    }
+
+    fn healthResult(self: *Tracer, code: u8) void {
+        const h = self.spec.health.?;
+        const now = sys.monoNs();
+        self.health_tid = 0;
+        self.next_health = now + @as(i128, h.interval_ms) * std.time.ns_per_ms;
+        if (code == 0) {
+            self.health_failures = 0;
+            self.setHealth("healthy");
+            return;
+        }
+        // Failures during the start period do not count against the container.
+        if (now - self.started_at < @as(i128, h.start_ms) * std.time.ns_per_ms) return;
+        self.health_failures += 1;
+        if (self.health_failures >= h.retries) self.setHealth("unhealthy");
     }
 
     /// The memory cgroup's job, done by hand: over the limit, the largest
