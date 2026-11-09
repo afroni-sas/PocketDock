@@ -46,6 +46,8 @@ pub const Config = struct {
     cpus_milli: u32 = 0,
     cpuset: u64 = 0,
     pids_limit: u32 = 0,
+    /// A stage of `pdock build`, hidden from `ps`.
+    builder: bool = false,
 };
 
 pub const PortEntry = struct { container: u16, host: u16 };
@@ -83,7 +85,19 @@ pub const CreateOptions = struct {
     cpus_milli: u32 = 0,
     cpuset: u64 = 0,
     pids_limit: u32 = 0,
+    builder: bool = false,
 };
+
+/// One RUN instruction of a build.
+pub const BuildStep = struct {
+    argv: []const []const u8,
+    env: []const []const u8,
+    workdir: []const u8,
+    uid: u32,
+    gid: u32,
+};
+
+pub const UserInfo = struct { uid: u32, gid: u32, home: []const u8 };
 
 pub const Stats = struct { pids: u64, memory: u64, cpu_ms: u64 };
 
@@ -108,7 +122,7 @@ fn installForwarder(sig: linux.SIG) void {
     _ = linux.sigaction(sig, &act, null);
 }
 
-fn stringArray(a: Allocator, v: ?std.json.Value) ![]const []const u8 {
+pub fn stringArray(a: Allocator, v: ?std.json.Value) ![]const []const u8 {
     const val = v orelse return &.{};
     if (val != .array) return &.{};
     var out: std.ArrayList([]const u8) = .empty;
@@ -120,9 +134,15 @@ fn stringArray(a: Allocator, v: ?std.json.Value) ![]const []const u8 {
 
 const PasswdEntry = struct { uid: u32, gid: u32, home: []const u8 };
 
-fn lookupPasswd(a: Allocator, rootfs: []const u8, user: []const u8) ?PasswdEntry {
-    const path = std.fmt.allocPrint(a, "{s}/etc/passwd", .{rootfs}) catch return null;
-    const data = sys.readFileAlloc(a, path, 1 << 20) catch return null;
+fn readGuest(a: Allocator, vfs: *vfs_mod.Vfs, path: []const u8) ?[]u8 {
+    var r: vfs_mod.Resolved = .{};
+    vfs.resolve(path, true, &r) catch return null;
+    if (!r.exists) return null;
+    return sys.readFileAlloc(a, r.host.slice(), 1 << 20) catch null;
+}
+
+fn lookupPasswd(a: Allocator, vfs: *vfs_mod.Vfs, user: []const u8) ?PasswdEntry {
+    const data = readGuest(a, vfs, "/etc/passwd") orelse return null;
     const num = std.fmt.parseInt(u32, user, 10) catch null;
     var lines = std.mem.tokenizeScalar(u8, data, '\n');
     while (lines.next()) |line| {
@@ -138,10 +158,9 @@ fn lookupPasswd(a: Allocator, rootfs: []const u8, user: []const u8) ?PasswdEntry
     return null;
 }
 
-fn lookupGroup(a: Allocator, rootfs: []const u8, group: []const u8) ?u32 {
+fn lookupGroup(a: Allocator, vfs: *vfs_mod.Vfs, group: []const u8) ?u32 {
     if (std.fmt.parseInt(u32, group, 10) catch null) |g| return g;
-    const path = std.fmt.allocPrint(a, "{s}/etc/group", .{rootfs}) catch return null;
-    const data = sys.readFileAlloc(a, path, 1 << 20) catch return null;
+    const data = readGuest(a, vfs, "/etc/group") orelse return null;
     var lines = std.mem.tokenizeScalar(u8, data, '\n');
     while (lines.next()) |line| {
         var f = std.mem.splitScalar(u8, line, ':');
@@ -167,8 +186,49 @@ pub const Manager = struct {
         return self.store.path(&.{ "containers", id, name });
     }
 
-    pub fn rootfs(self: *Manager, image_id: []const u8) []const u8 {
-        return self.store.path(&.{ "images", image_id, "rootfs" });
+    /// The read-only layers of an image, topmost first.
+    pub fn imageLayers(self: *Manager, image_id: []const u8) ![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        var id = image_id;
+        while (true) {
+            try out.append(self.a, self.store.path(&.{ "images", id, "rootfs" }));
+            id = sys.readFileAlloc(self.a, self.store.path(&.{ "images", id, "parent" }), 128) catch break;
+        }
+        return out.items;
+    }
+
+    /// A read-only view of an image, for reading files out of it.
+    pub fn imageVfs(self: *Manager, image_id: []const u8) !*vfs_mod.Vfs {
+        const layers = try self.imageLayers(image_id);
+        const vfs = try self.a.create(vfs_mod.Vfs);
+        vfs.* = .{ .upper = layers[0], .lowers = layers[1..], .work = "", .mounts = &.{}, .raw = true };
+        return vfs;
+    }
+
+    /// The base of `FROM scratch`: a layer with nothing in it.
+    pub fn emptyImage(self: *Manager) ![]const u8 {
+        try sys.mkdirP(self.store.path(&.{ "images", "scratch", "rootfs" }), 0o755);
+        try sys.writeFile(self.store.path(&.{ "images", "scratch", "config.json" }), "{\"config\":{}}", 0o600);
+        return "scratch";
+    }
+
+    /// Resolves `USER[:GROUP]` against the image's own account files.
+    pub fn resolveUser(self: *Manager, vfs: *vfs_mod.Vfs, spec: []const u8) !UserInfo {
+        const colon = std.mem.indexOfScalar(u8, spec, ':');
+        const user = if (colon) |i| spec[0..i] else spec;
+        var info: UserInfo = .{ .uid = 0, .gid = 0, .home = "/root" };
+        if (lookupPasswd(self.a, vfs, user)) |e| {
+            info = .{ .uid = e.uid, .gid = e.gid, .home = e.home };
+        } else if (std.fmt.parseInt(u32, user, 10) catch null) |n| {
+            info = .{ .uid = n, .gid = 0, .home = "/" };
+        } else {
+            sys.eprint("error: unknown user \"{s}\" in image\n", .{user});
+            return error.UnknownUser;
+        }
+        if (colon) |i| {
+            info.gid = lookupGroup(self.a, vfs, spec[i + 1 ..]) orelse return error.UnknownGroup;
+        }
+        return info;
     }
 
     pub fn loadConfig(self: *Manager, id: []const u8) !Config {
@@ -231,10 +291,10 @@ pub const Manager = struct {
         return list.items;
     }
 
-    fn makeVfs(self: *Manager, cfg: *const Config) !*vfs_mod.Vfs {
+    pub fn makeVfs(self: *Manager, cfg: *const Config) !*vfs_mod.Vfs {
         const vfs = try self.a.create(vfs_mod.Vfs);
         vfs.* = .{
-            .lower = self.rootfs(cfg.image_id),
+            .lowers = try self.imageLayers(cfg.image_id),
             .upper = self.file(cfg.id, "upper"),
             .work = self.file(cfg.id, "work"),
             .mounts = try self.mounts(cfg),
@@ -277,7 +337,6 @@ pub const Manager = struct {
             return error.NoCommand;
         }
 
-        const lower = self.rootfs(opts.image_id);
         const user_str = opts.user orelse blk: {
             const u = img.object.get("User") orelse break :blk "";
             break :blk if (u == .string) u.string else "";
@@ -286,22 +345,10 @@ pub const Manager = struct {
         var gid: u32 = 0;
         var home: []const u8 = "/root";
         if (user_str.len > 0) {
-            const colon = std.mem.indexOfScalar(u8, user_str, ':');
-            const user = if (colon) |i| user_str[0..i] else user_str;
-            if (lookupPasswd(a, lower, user)) |e| {
-                uid = e.uid;
-                gid = e.gid;
-                home = e.home;
-            } else if (std.fmt.parseInt(u32, user, 10) catch null) |n| {
-                uid = n;
-                home = "/";
-            } else {
-                sys.eprint("error: unknown user \"{s}\" in image\n", .{user});
-                return error.UnknownUser;
-            }
-            if (colon) |i| {
-                gid = lookupGroup(a, lower, user_str[i + 1 ..]) orelse return error.UnknownGroup;
-            }
+            const info = try self.resolveUser(try self.imageVfs(opts.image_id), user_str);
+            uid = info.uid;
+            gid = info.gid;
+            home = info.home;
         }
 
         const hostname = opts.hostname orelse id[0..12];
@@ -349,6 +396,7 @@ pub const Manager = struct {
             .cpus_milli = opts.cpus_milli,
             .cpuset = opts.cpuset,
             .pids_limit = opts.pids_limit,
+            .builder = opts.builder,
         };
 
         try sys.mkdirP(self.file(id, "run"), 0o755);
@@ -558,9 +606,11 @@ pub const Manager = struct {
         const id = cfg.id;
         var state: State = .{ .shim_pid = linux.getpid(), .status = "running" };
 
+        // The tracer grows this list with the same allocator.
         var ports: std.ArrayList(tracer.PortMap) = .empty;
+        defer ports.deinit(self.gpa);
         for (cfg.ports) |p| {
-            try ports.append(self.a, .{ .container = p.container, .host = p.host, .fixed = true });
+            try ports.append(self.gpa, .{ .container = p.container, .host = p.host, .fixed = true });
         }
 
         const vfs = try self.makeVfs(cfg);
@@ -692,6 +742,57 @@ pub const Manager = struct {
             return cfg.max_retries == 0 or restarts < cfg.max_retries;
         }
         return false;
+    }
+
+    /// Runs one RUN instruction inside a build stage's container.
+    pub fn runBuildStep(self: *Manager, cfg: *const Config, step: BuildStep) !u8 {
+        const vfs = try self.makeVfs(cfg);
+        var patched = cfg.*;
+        patched.env = step.env;
+        patched.workdir = step.workdir;
+        var ports: std.ArrayList(tracer.PortMap) = .empty;
+        defer ports.deinit(self.gpa);
+        var spec: tracer.Spec = .{
+            .vfs = vfs,
+            .exec_path = try self.findExecutable(vfs, &patched, step.argv[0]),
+            .argv = try self.zList(step.argv),
+            .envp = try self.zList(step.env),
+            .cwd = step.workdir,
+            .hostname = cfg.hostname,
+            .uid = step.uid,
+            .gid = step.gid,
+            .ports = &ports,
+            .sock_dir = self.store.path(&.{"sk"}),
+            .stdin_fd = try sys.open("/dev/null", 0, 0),
+            .ns_id = cfg.id,
+            .debug = self.debug,
+        };
+        return tracer.Tracer.run(self.gpa, &spec);
+    }
+
+    /// Turns a finished build stage into an image. Its writable layer moves
+    /// as it is, so this takes no time and no extra space.
+    pub fn commitBuild(self: *Manager, cfg: *const Config, config_json: []const u8) ![]const u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(config_json);
+        hash.update(cfg.id);
+        hash.update(cfg.image_id);
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        const id = try std.fmt.allocPrint(self.a, "{x}", .{&digest});
+
+        try sys.mkdirP(self.store.path(&.{ "images", id }), 0o700);
+        var from = try Path.of(self.file(cfg.id, "upper"));
+        var to = try Path.of(self.store.path(&.{ "images", id, "rootfs" }));
+        try sys.rename(from.z(), to.z());
+        try sys.writeFile(self.store.path(&.{ "images", id, "config.json" }), config_json, 0o600);
+        try sys.writeFile(self.store.path(&.{ "images", id, "parent" }), cfg.image_id, 0o600);
+        self.removeFiles(cfg.id);
+        return id;
+    }
+
+    pub fn discardBuild(self: *Manager, id: []const u8) void {
+        self.removeFiles(id);
     }
 
     /// Connects to a running container's tracer. It sits in a blocking wait,
@@ -838,11 +939,16 @@ pub const Manager = struct {
         self.removeFiles(id);
     }
 
-    /// True when any container, running or not, is based on `image_id`.
+    /// True when a container, running or not, or another image is built on
+    /// `image_id`.
     pub fn imageInUse(self: *Manager, image_id: []const u8) !bool {
         for (try self.listIds()) |id| {
             const cfg = self.loadConfig(id) catch continue;
             if (std.mem.eql(u8, cfg.image_id, image_id)) return true;
+        }
+        for (try self.store.listDir("images")) |other| {
+            const parent = sys.readFileAlloc(self.a, self.store.path(&.{ "images", other, "parent" }), 128) catch continue;
+            if (std.mem.eql(u8, parent, image_id)) return true;
         }
         return false;
     }

@@ -113,7 +113,23 @@ Also:
   with `--network private` or `none`.
 - Guests resolve names through public DNS servers unless `POCKETDOCK_DNS` is set.
 - 32-bit images, and images for another CPU architecture, are not supported.
-- Building images from a Dockerfile is not implemented yet.
+- `pdock build` has no cache yet: every build runs all its steps.
+
+## Building images
+
+```bash
+pdock build -t myapp --build-arg VERSION=1.2 .
+pdock run myapp
+```
+
+Multi-stage builds, `RUN` (including `<<EOF` blocks), `COPY --from`, `ARG`,
+`ENV`, `WORKDIR`, `USER`, `CMD`, `ENTRYPOINT`, `EXPOSE`, `LABEL`, `SHELL` and
+`.dockerignore` are supported. `VOLUME`, `HEALTHCHECK`, `STOPSIGNAL` and
+`ONBUILD` are accepted and ignored. `ADD` does not yet fetch URLs or unpack
+archives; it fails with a message rather than doing something different.
+
+A built image only stores what it changed. Its base is shared, so building
+on the phone does not copy the image.
 
 ## How the filesystem works
 
@@ -121,8 +137,9 @@ The image is unpacked once and never modified. When a container first writes
 into a directory, that directory is copied into the container's writable layer
 as a complete listing whose untouched entries are zero-length stubs. From then
 on the directory is an ordinary one: listing it needs no merging and deleting
-needs no whiteouts. Directories nobody writes to cost nothing. See
-[src/vfs.zig](src/vfs.zig).
+needs no whiteouts. Directories nobody writes to cost nothing. A finished
+writable layer can itself become a read-only layer of a new image, which is how
+`pdock build` commits without copying. See [src/vfs.zig](src/vfs.zig).
 
 ## Layout
 
@@ -132,6 +149,7 @@ needs no whiteouts. Directories nobody writes to cost nothing. See
 | [src/syscalls.zig](src/syscalls.zig) | Table of intercepted syscalls, also used to build the seccomp filter |
 | [src/vfs.zig](src/vfs.zig) | Path resolution and copy-on-write |
 | [src/registry.zig](src/registry.zig), [src/layer.zig](src/layer.zig) | OCI pull and layer extraction |
+| [src/builder.zig](src/builder.zig), [src/dockerfile.zig](src/dockerfile.zig) | `pdock build` and Dockerfile parsing |
 | [src/container.zig](src/container.zig) | Lifecycle, supervision, logs |
 | [src/control.zig](src/control.zig) | The channel used by `exec` and `stats` |
 | [src/quota.zig](src/quota.zig) | Resource accounting and limit parsing |

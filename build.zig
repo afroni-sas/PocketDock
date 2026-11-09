@@ -27,6 +27,12 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
     test_step.dependOn(&b.addRunArtifact(quota_tests).step);
+    const dockerfile_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/dockerfile.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(dockerfile_tests).step);
 
     // `zig build android` needs neither the NDK nor a libc: the engine is a
     // static binary that only talks to the kernel.

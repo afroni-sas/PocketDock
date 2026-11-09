@@ -1,8 +1,10 @@
 //! A copy-on-write root filesystem implemented entirely in the tracer.
 //!
 //! Unprivileged Android has no overlayfs, no bind mounts and no hard links, so
-//! the union lives in user space. `lower` is the read-only image and `upper`
-//! holds this container's changes.
+//! the union lives in user space. `lowers` are the read-only layers of the
+//! image, topmost first, and `upper` holds this container's changes. A layer
+//! is simply the `upper` of an earlier container, which is what makes
+//! committing a build step instant and lets images share their base.
 //!
 //! Instead of whiteouts and merged directory listings, a directory is copied
 //! into `upper` the first time it is modified, as a complete listing where
@@ -65,11 +67,11 @@ fn notFound() bool {
 }
 
 const max_depth = 256;
-const St = enum(u8) { upper, lower };
-const Found = enum { missing, upper, lower, mount };
+const Found = enum { missing, layer, mount };
 
 pub const Vfs = struct {
-    lower: []const u8,
+    /// Read-only layers, topmost first. The last one has no stubs.
+    lowers: []const []const u8,
     upper: []const u8,
     /// Scratch space on the same filesystem as `upper`.
     work: []const u8,
@@ -92,7 +94,18 @@ pub const Vfs = struct {
         return best;
     }
 
-    fn lookup(self: *Vfs, canon: []const u8, cur: St, host: *Path, st: *sys.Stat) Err!Found {
+    fn layer(self: *const Vfs, level: usize) []const u8 {
+        return if (level == 0) self.upper else self.lowers[level - 1];
+    }
+
+    fn levels(self: *const Vfs) usize {
+        return self.lowers.len + 1;
+    }
+
+    /// Finds `canon` given `cur`, the level where its parent has a real,
+    /// complete listing. Missing from that level means it does not exist. A
+    /// stub, or a miss on the way further down, means looking deeper.
+    fn lookup(self: *Vfs, canon: []const u8, cur: usize, host: *Path, st: *sys.Stat, level_out: *usize) Err!Found {
         if (self.mountFor(canon)) |m| {
             try host.set(m.host);
             try host.append(canon[m.guest.len..]);
@@ -100,24 +113,23 @@ pub const Vfs = struct {
                 if (notFound()) return .missing;
                 return error.Sys;
             };
+            level_out.* = cur;
             return .mount;
         }
-        if (cur == .upper) {
-            try host.set(self.upper);
+        var level = cur;
+        while (level < self.levels()) : (level += 1) {
+            try host.set(self.layer(level));
             try host.append(canon);
             sys.lstat(host.z(), st) catch {
-                if (notFound()) return .missing;
-                return error.Sys;
+                if (!notFound()) return error.Sys;
+                if (level == cur) return .missing;
+                continue;
             };
-            if (!isStub(st)) return .upper;
+            if (isStub(st)) continue;
+            level_out.* = level;
+            return .layer;
         }
-        try host.set(self.lower);
-        try host.append(canon);
-        sys.lstat(host.z(), st) catch {
-            if (notFound()) return .missing;
-            return error.Sys;
-        };
-        return .lower;
+        return .missing;
     }
 
     /// Resolves an absolute guest path, following symlinks in guest terms so
@@ -131,12 +143,13 @@ pub const Vfs = struct {
         var rem = try Path.of(guest);
         var pos: usize = 0;
         var depth: usize = 0;
-        var cur: St = .upper;
+        var cur: usize = 0;
         var links: u32 = 0;
         var bounds: [max_depth]u16 = undefined;
-        var parents: [max_depth]St = undefined;
+        var parents: [max_depth]usize = undefined;
         var stale = true; // `out.host` does not describe `canon` yet
-        var last_found: Found = .upper;
+        var last_found: Found = .layer;
+        var last_level: usize = 0;
         var st: sys.Stat = undefined;
 
         out.guest.len = 0;
@@ -183,7 +196,8 @@ pub const Vfs = struct {
             try canon.append("/");
             try canon.append(comp);
 
-            const found = try self.lookup(canon.slice(), cur, &out.host, &st);
+            var found_level: usize = cur;
+            const found = try self.lookup(canon.slice(), cur, &out.host, &st, &found_level);
             stale = false;
 
             if (found == .missing) {
@@ -211,7 +225,7 @@ pub const Vfs = struct {
                 if (target.len > 0 and target[0] == '/') {
                     depth = 0;
                     canon.len = 0;
-                    cur = .upper;
+                    cur = 0;
                 } else {
                     canon.len = bounds[depth];
                     cur = parents[depth];
@@ -224,16 +238,13 @@ pub const Vfs = struct {
                 // Leave it to the kernel to report ENOTDIR.
                 try out.host.append(rem.buf[pos..rem.len]);
                 try canon.append(rem.buf[pos..rem.len]);
-                out.where = whereOf(found);
+                out.where = whereOf(found, found_level);
                 return;
             }
 
             last_found = found;
-            switch (found) {
-                .upper => cur = .upper,
-                .lower => cur = .lower,
-                else => {},
-            }
+            last_level = found_level;
+            if (found == .layer) cur = found_level;
             if (trailing) try out.host.append("/");
         }
 
@@ -247,7 +258,7 @@ pub const Vfs = struct {
             return;
         }
         if (stale) {
-            last_found = try self.lookup(canon.slice(), parents[depth - 1], &out.host, &st);
+            last_found = try self.lookup(canon.slice(), parents[depth - 1], &out.host, &st, &last_level);
             if (last_found == .missing) {
                 try self.setMissing(canon.slice(), parents[depth - 1], true, out);
                 return;
@@ -256,19 +267,16 @@ pub const Vfs = struct {
         out.exists = true;
         out.parent_ok = true;
         out.mode = st.mode;
-        out.where = whereOf(last_found);
+        out.where = whereOf(last_found, last_level);
         if (last_found == .mount) out.mount_ro = self.mountFor(canon.slice()).?.ro;
     }
 
-    fn whereOf(f: Found) Where {
-        return switch (f) {
-            .upper, .missing => .upper,
-            .lower => .lower,
-            .mount => .mount,
-        };
+    fn whereOf(f: Found, level: usize) Where {
+        if (f == .mount) return .mount;
+        return if (level == 0) .upper else .lower;
     }
 
-    fn setMissing(self: *Vfs, canon: []const u8, cur: St, is_last: bool, out: *Resolved) Err!void {
+    fn setMissing(self: *Vfs, canon: []const u8, cur: usize, is_last: bool, out: *Resolved) Err!void {
         out.exists = false;
         out.parent_ok = is_last;
         if (self.mountFor(canon)) |m| {
@@ -276,8 +284,8 @@ pub const Vfs = struct {
             out.mount_ro = m.ro;
             return;
         }
-        out.where = if (cur == .upper) .upper else .lower;
-        try out.host.set(if (cur == .upper) self.upper else self.lower);
+        out.where = if (cur == 0) .upper else .lower;
+        try out.host.set(self.layer(cur));
         try out.host.append(canon);
     }
 
@@ -389,7 +397,8 @@ pub const Vfs = struct {
             try out.append(host[m.host.len..]);
             return true;
         }
-        for ([_][]const u8{ self.upper, self.lower }) |base| {
+        for (0..self.levels()) |level| {
+            const base = self.layer(level);
             if (!std.mem.startsWith(u8, host, base)) continue;
             if (host.len == base.len) {
                 try out.set("/");
@@ -402,13 +411,28 @@ pub const Vfs = struct {
         return false;
     }
 
+    /// Finds the real copy of `canon` in the read-only layers.
+    fn findBelow(self: *Vfs, canon: []const u8, out: *Path, st: *sys.Stat) Err!void {
+        var level: usize = 1;
+        while (level < self.levels()) : (level += 1) {
+            try out.set(self.layer(level));
+            try out.append(canon);
+            sys.lstat(out.z(), st) catch {
+                if (notFound()) continue;
+                return error.Sys;
+            };
+            if (!isStub(st)) return;
+        }
+        return sys.fail(.NOENT);
+    }
+
     /// Turns the stub directory `prefix` into a real one with a full listing.
     /// Built aside and renamed in, so a crash never leaves a partial listing.
     fn materialize(self: *Vfs, prefix: []const u8) Err!void {
-        var lower_p = try Path.join(self.lower, prefix);
-        var upper_p = try Path.join(self.upper, prefix);
+        var lower_p: Path = .{};
         var lower_st: sys.Stat = undefined;
-        try sys.lstat(lower_p.z(), &lower_st);
+        try self.findBelow(prefix, &lower_p, &lower_st);
+        var upper_p = try Path.join(self.upper, prefix);
 
         self.work_seq +%= 1;
         var name_buf: [64]u8 = undefined;
@@ -581,7 +605,9 @@ pub const Vfs = struct {
             if (sys.isDir(st.mode)) {
                 try self.materializeTree(child.slice());
             } else if (isStub(&st)) {
-                var low = try Path.join(self.lower, child.slice());
+                var low: Path = .{};
+                var low_st: sys.Stat = undefined;
+                try self.findBelow(child.slice(), &low, &low_st);
                 try copyFile(low.z(), up.z());
             }
         }
@@ -623,6 +649,7 @@ const Fixture = struct {
     lower: Path,
     upper: Path,
     work: Path,
+    layers: [1][]const u8,
     vfs: Vfs,
 
     fn write(self: *Fixture, rel: []const u8, data: []const u8) !void {
@@ -668,8 +695,9 @@ fn setup(fx: *Fixture) !void {
     try sys.symlink("../../../../../../..", link.z());
     var abs = try Path.join(fx.lower.slice(), "/abs");
     try sys.symlink("/etc", abs.z());
+    fx.layers[0] = fx.lower.slice();
     fx.vfs = .{
-        .lower = fx.lower.slice(),
+        .lowers = &fx.layers,
         .upper = fx.upper.slice(),
         .work = fx.work.slice(),
         .mounts = &.{},
@@ -808,4 +836,64 @@ test "creating a file seals only its own directory" {
     var up = try Path.join(fx.upper.slice(), "/usr/lib/python");
     var st: sys.Stat = undefined;
     try testing.expectError(error.Sys, sys.lstat(up.z(), &st));
+}
+
+test "a committed container works as a layer of the next one" {
+    var fx: Fixture = undefined;
+    try setup(&fx);
+    defer fx.deinit();
+
+    // First build step: change one file, delete another, add a third.
+    var r: Resolved = .{};
+    try fx.vfs.resolve("/etc/passwd", true, &r);
+    try fx.vfs.prepareWrite(&r);
+    try sys.writeFile(r.host.slice(), "changed\n", 0o644);
+    try fx.vfs.resolve("/etc/hostname", false, &r);
+    try fx.vfs.prepareRemove(&r);
+    try sys.unlink(r.host.z());
+    try fx.vfs.resolve("/etc/added", false, &r);
+    try fx.vfs.prepareCreate(&r);
+    try sys.writeFile(r.host.slice(), "new\n", 0o644);
+
+    // Second step: a new container on top of both.
+    var upper2 = try Path.join(fx.base.slice(), "/upper2");
+    const layers = [2][]const u8{ fx.upper.slice(), fx.lower.slice() };
+    var next: Vfs = .{
+        .lowers = &layers,
+        .upper = upper2.slice(),
+        .work = fx.work.slice(),
+        .mounts = &.{},
+        .raw = true,
+    };
+    try next.init();
+
+    try next.resolve("/etc/passwd", true, &r);
+    const changed = try fx.read(&r);
+    defer testing.allocator.free(changed);
+    try testing.expectEqualStrings("changed\n", changed);
+    try next.resolve("/etc/added", true, &r);
+    try testing.expect(r.exists);
+    try next.resolve("/etc/hostname", true, &r);
+    try testing.expect(!r.exists);
+    // A stub in the middle layer leads down to the base.
+    try next.resolve("/etc/conf.d/a", true, &r);
+    const base = try fx.read(&r);
+    defer testing.allocator.free(base);
+    try testing.expectEqualStrings("a\n", base);
+
+    // Writing copies into the new upper and leaves both layers alone.
+    try next.resolve("/usr/lib/python/mod.py", true, &r);
+    try next.prepareWrite(&r);
+    try sys.writeFile(r.host.slice(), "edited\n", 0o644);
+    const orig = try sys.readFileAlloc(testing.allocator, (try Path.join(fx.lower.slice(), "/usr/lib/python/mod.py")).slice(), 64);
+    defer testing.allocator.free(orig);
+    try testing.expectEqualStrings("code\n", orig);
+    // Sealing a directory that is itself made of stubs keeps the listing.
+    try next.resolve("/etc/new2", false, &r);
+    try next.prepareCreate(&r);
+    try sys.writeFile(r.host.slice(), "x", 0o644);
+    try next.resolve("/etc/added", true, &r);
+    try testing.expect(r.exists);
+    try next.resolve("/etc/hostname", true, &r);
+    try testing.expect(!r.exists);
 }
