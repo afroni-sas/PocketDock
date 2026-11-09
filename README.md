@@ -123,3 +123,7 @@ needs no whiteouts. Directories nobody writes to cost nothing. See
 | [src/control.zig](src/control.zig) | The channel used by `exec` and `stats` |
 | [src/quota.zig](src/quota.zig) | Resource accounting and limit parsing |
 | [src/dns.zig](src/dns.zig) | DNS through Android's resolver daemon |
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
