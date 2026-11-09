@@ -319,7 +319,7 @@ pub fn extract(gpa: std.mem.Allocator, io: std.Io, blob: []const u8, root: []con
         .root = root,
         .gpa = gpa,
         .buf = work,
-        .vfs = .{ .lower = root, .upper = root, .work = root, .mounts = &.{}, .raw = true },
+        .vfs = .{ .lowers = &.{}, .upper = root, .work = root, .mounts = &.{}, .raw = true },
     };
 
     const magic = input.peek(4) catch |e| switch (e) {

@@ -822,7 +822,7 @@ pub const Tracer = struct {
         if (spec.ctl_path.len > 0) self.ctl_fd = try control.listen(spec.ctl_path);
 
         self.filter_len = buildFilter(&self.filter, spec.net_mode != .bridge);
-        try self.lower_z.set(spec.vfs.lower);
+        try self.lower_z.set(spec.vfs.lowers[spec.vfs.lowers.len - 1]);
 
         // Prepared before forking: the child must not allocate.
         const argv_z = try gpa.alloc(?[*:0]const u8, spec.argv.len + 1);
@@ -2125,8 +2125,10 @@ fn doChmod(c: *Ctx, sc: Sc) Err!void {
 fn fdInLower(c: *Ctx, fd: i32) Err!bool {
     var buf: [sys.PATH_MAX]u8 = undefined;
     const host = try c.fdHostPath(fd, &buf);
-    const lower = c.tr.vfs.lower;
-    return std.mem.startsWith(u8, host, lower) and (host.len == lower.len or host[lower.len] == '/');
+    for (c.tr.vfs.lowers) |lower| {
+        if (std.mem.startsWith(u8, host, lower) and (host.len == lower.len or host[lower.len] == '/')) return true;
+    }
+    return false;
 }
 
 fn doFchmod(c: *Ctx, sc: Sc) Err!void {
