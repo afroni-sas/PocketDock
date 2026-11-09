@@ -18,7 +18,7 @@ const version = "0.1.0";
 const usage =
     \\PocketDock: run OCI containers on Android, without root.
     \\
-    \\Usage: pocketdock <command> [options]
+    \\Usage: pdock <command> [options]
     \\
     \\Containers
     \\  run [options] IMAGE [COMMAND...]   Create and start a container
@@ -96,7 +96,7 @@ pub fn main(init: std.process.Init) !void {
     const rest: []const [:0]const u8 = args[2..];
 
     if (std.mem.eql(u8, cmd, "version")) {
-        sys.print("pocketdock {s} ({s}, zig {s})\n", .{ version, arch.oci_arch, builtin.zig_version_string });
+        sys.print("pdock {s} ({s}, zig {s})\n", .{ version, arch.oci_arch, builtin.zig_version_string });
         return;
     }
 
@@ -140,7 +140,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
     }
-    die("unknown command \"{s}\" (try: pocketdock help)", .{cmd});
+    die("unknown command \"{s}\" (try: pdock help)", .{cmd});
 }
 
 fn eql(a: []const u8, b: []const u8) bool {
@@ -148,7 +148,7 @@ fn eql(a: []const u8, b: []const u8) bool {
 }
 
 fn cmdPull(c: *Ctx, args: []const [:0]const u8) !void {
-    if (args.len != 1) die("usage: pocketdock pull IMAGE", .{});
+    if (args.len != 1) die("usage: pdock pull IMAGE", .{});
     _ = try registry.pull(c.a, c.gpa, c.io, c.store, args[0], true);
 }
 
@@ -253,7 +253,7 @@ fn cmdRun(c: *Ctx, args: []const [:0]const u8) !void {
             die("unknown option \"{s}\" for run", .{o});
         }
     }
-    if (i >= args.len) die("usage: pocketdock run [options] IMAGE [COMMAND...]", .{});
+    if (i >= args.len) die("usage: pdock run [options] IMAGE [COMMAND...]", .{});
 
     const image: []const u8 = args[i];
     const command = try c.a.alloc([]const u8, args.len - i - 1);
@@ -278,7 +278,7 @@ fn cmdRun(c: *Ctx, args: []const [:0]const u8) !void {
 }
 
 fn cmdStart(c: *Ctx, args: []const [:0]const u8) !void {
-    if (args.len != 1) die("usage: pocketdock start NAME", .{});
+    if (args.len != 1) die("usage: pdock start NAME", .{});
     _ = try c.mgr.start(try c.mgr.find(args[0]), .detached);
     sys.print("{s}\n", .{args[0]});
 }
@@ -290,7 +290,7 @@ fn cmdStop(c: *Ctx, args: []const [:0]const u8) !void {
         t = try std.fmt.parseInt(u32, args[1], 10);
         i = 2;
     }
-    if (i >= args.len) die("usage: pocketdock stop [-t SEC] NAME", .{});
+    if (i >= args.len) die("usage: pdock stop [-t SEC] NAME", .{});
     for (args[i..]) |n| {
         try c.mgr.stop(try c.mgr.find(n), t);
         sys.print("{s}\n", .{n});
@@ -298,7 +298,7 @@ fn cmdStop(c: *Ctx, args: []const [:0]const u8) !void {
 }
 
 fn cmdRestart(c: *Ctx, args: []const [:0]const u8) !void {
-    if (args.len != 1) die("usage: pocketdock restart NAME", .{});
+    if (args.len != 1) die("usage: pdock restart NAME", .{});
     const id = try c.mgr.find(args[0]);
     try c.mgr.stop(id, 10);
     _ = try c.mgr.start(id, .detached);
@@ -312,7 +312,7 @@ fn cmdRm(c: *Ctx, args: []const [:0]const u8) !void {
         force = true;
         i = 1;
     }
-    if (i >= args.len) die("usage: pocketdock rm [-f] NAME", .{});
+    if (i >= args.len) die("usage: pdock rm [-f] NAME", .{});
     for (args[i..]) |n| {
         try c.mgr.remove(try c.mgr.find(n), force);
         sys.print("{s}\n", .{n});
@@ -407,7 +407,7 @@ fn cmdLogs(c: *Ctx, args: []const [:0]const u8) !void {
             name = o;
         }
     }
-    try container.printLogs(c.mgr, try c.mgr.find(name orelse die("usage: pocketdock logs [-f] NAME", .{})), follow, tail, ts);
+    try container.printLogs(c.mgr, try c.mgr.find(name orelse die("usage: pdock logs [-f] NAME", .{})), follow, tail, ts);
 }
 
 fn cmdExec(c: *Ctx, args: []const [:0]const u8) !void {
@@ -427,7 +427,7 @@ fn cmdExec(c: *Ctx, args: []const [:0]const u8) !void {
             die("unknown option \"{s}\" for exec", .{o});
         }
     }
-    if (i + 1 >= args.len) die("usage: pocketdock exec [-it] NAME COMMAND...", .{});
+    if (i + 1 >= args.len) die("usage: pdock exec [-it] NAME COMMAND...", .{});
     const id = try c.mgr.find(args[i]);
     const command = try c.a.alloc([]const u8, args.len - i - 1);
     for (args[i + 1 ..], 0..) |s, k| command[k] = s;
@@ -435,7 +435,7 @@ fn cmdExec(c: *Ctx, args: []const [:0]const u8) !void {
 }
 
 fn cmdInspect(c: *Ctx, args: []const [:0]const u8) !void {
-    if (args.len != 1) die("usage: pocketdock inspect NAME", .{});
+    if (args.len != 1) die("usage: pdock inspect NAME", .{});
     const id = try c.mgr.find(args[0]);
     const data = .{ .config = try c.mgr.loadConfig(id), .state = try c.mgr.loadState(id) };
     sys.print("{s}\n", .{try std.json.Stringify.valueAlloc(c.a, data, .{ .whitespace = .indent_2 })});
@@ -449,7 +449,7 @@ fn cmdImages(c: *Ctx, _: []const [:0]const u8) !void {
 }
 
 fn cmdRmi(c: *Ctx, args: []const [:0]const u8) !void {
-    if (args.len != 1) die("usage: pocketdock rmi IMAGE", .{});
+    if (args.len != 1) die("usage: pdock rmi IMAGE", .{});
     const ref = try registry.parseRef(c.a, args[0]);
     const id = c.store.getRef(ref.name) orelse die("no such image: {s}", .{args[0]});
     if (try c.mgr.imageInUse(id)) die("image is used by a container; remove the container first", .{});
