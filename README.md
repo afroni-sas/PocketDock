@@ -1,11 +1,14 @@
+<div align="center">
+
+<img src="docs/images/logo.svg" width="112" height="112" alt="PocketDock logo">
+
 # PocketDock
+
+</div>
 
 A container engine for Android that needs no root. It pulls ordinary Docker/OCI
 images from any registry and runs them on the phone, so an app written in any
 language runs unchanged. It is a single static binary with no dependencies.
-
-PocketDock is the engine of a self-hosted, Railway-style platform for Android.
-The control panel will be built on top of it.
 
 ## Install
 
