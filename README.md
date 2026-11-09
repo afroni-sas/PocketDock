@@ -18,7 +18,7 @@ space, by intercepting the system calls of the container's processes with
 
 ## Build
 
-Requires Zig `0.17.0-dev.2163`. No NDK or libc is needed.
+Requires Zig `0.17.1`. No NDK or libc is needed.
 
 ```bash
 zig build android        # zig-out/android/{arm64-v8a,x86_64}/pocketdock
