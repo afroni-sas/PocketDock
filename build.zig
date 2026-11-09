@@ -48,7 +48,7 @@ fn addEngine(
     strip: bool,
 ) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
-        .name = "pocketdock",
+        .name = "pdock",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,

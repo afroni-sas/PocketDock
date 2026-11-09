@@ -7,6 +7,19 @@ language runs unchanged. It is a single static binary with no dependencies.
 PocketDock is the engine of a self-hosted, Railway-style platform for Android.
 The control panel will be built on top of it.
 
+## Install
+
+In Termux, or on Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/afroni-sas/PocketDock/main/install.sh | sh
+```
+
+The script picks the binary for your CPU, checks its checksum and puts
+`pdock` on your PATH. Binaries are also attached to each
+[release](https://github.com/afroni-sas/PocketDock/releases), for 64-bit ARM
+(`arm64-v8a`) and `x86_64` devices.
+
 ## Why not Docker?
 
 Docker relies on kernel features that an unprivileged Android app cannot use:
@@ -18,10 +31,10 @@ space, by intercepting the system calls of the container's processes with
 
 ## Build
 
-Requires Zig `0.17.0-dev.2163`. No NDK or libc is needed.
+Requires Zig `0.17.1`. No NDK or libc is needed.
 
 ```bash
-zig build android        # zig-out/android/{arm64-v8a,x86_64}/pocketdock
+zig build android        # zig-out/android/{arm64-v8a,x86_64}/pdock
 zig build --release      # for the host
 zig build test
 ```
@@ -29,15 +42,15 @@ zig build test
 ## Use
 
 ```bash
-pocketdock run -d --name web -p 8080:8000 python:3.12-alpine python -m http.server 8000
-pocketdock ps
-pocketdock logs -f web
-pocketdock exec web sh -c 'python --version'
-pocketdock stop web
-pocketdock rm web
+pdock run -d --name web -p 8080:8000 python:3.12-alpine python -m http.server 8000
+pdock ps
+pdock logs -f web
+pdock exec web sh -c 'python --version'
+pdock stop web
+pdock rm web
 ```
 
-`pocketdock help` lists every command. `pocketdock doctor` reports what the
+`pdock help` lists every command. `pdock doctor` reports what the
 device's kernel allows. Data lives in `~/.pocketdock`, or `$POCKETDOCK_ROOT`.
 
 ## What a container gets
@@ -67,12 +80,12 @@ the phone's own services.
 | `none` | Its own loopback only |
 
 Each container port is backed by a free host port, so several containers can
-use the same one, including ports below 1024. `pocketdock ps` shows the mapping.
+use the same one, including ports below 1024. `pdock ps` shows the mapping.
 
 ### Limits
 
 ```bash
-pocketdock run -m 512m --cpus 0.5 --cpuset-cpus 0-3 --pids-limit 200 IMAGE
+pdock run -m 512m --cpus 0.5 --cpuset-cpus 0-3 --pids-limit 200 IMAGE
 ```
 
 Android gives apps no cgroups, so the tracer enforces these itself and reports
@@ -123,3 +136,7 @@ needs no whiteouts. Directories nobody writes to cost nothing. See
 | [src/control.zig](src/control.zig) | The channel used by `exec` and `stats` |
 | [src/quota.zig](src/quota.zig) | Resource accounting and limit parsing |
 | [src/dns.zig](src/dns.zig) | DNS through Android's resolver daemon |
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).

@@ -1,0 +1,80 @@
+name: Bug report
+description: Something does not work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. You can write in English or French.
+        Please remove tokens, passwords and personal data from logs and screenshots.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The exact `pdock` commands and the image are very helpful.
+      placeholder: |
+        1. pdock run --rm alpine:3.20 ...
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Phone and Android version
+      placeholder: TECNO BG7n, Android 13
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: PocketDock version
+      description: Output of `pdock version`, or the commit.
+    validations:
+      required: true
+  - type: dropdown
+    id: context
+    attributes:
+      label: Where does it run?
+      options:
+        - Termux
+        - adb shell
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Images and registries
+        - Running containers
+        - Filesystem
+        - Processes
+        - Network
+        - Memory or CPU limits
+        - Logs
+        - Installation
+        - Build
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Device report
+      description: Output of `pdock doctor`.
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Output of `pdock logs NAME`. For a crash, `POCKETDOCK_TRACE=1` also prints every intercepted system call.
+      render: text
