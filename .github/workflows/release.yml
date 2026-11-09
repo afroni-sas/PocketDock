@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  release:
+    name: Build and publish the Android binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag against the version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! grep -qF ".version = \"$version\"" build.zig.zon; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match .version in build.zig.zon"
+            exit 1
+          fi
+          if ! grep -qF "const version = \"$version\"" src/main.zig; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version in src/main.zig"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - uses: mlugg/setup-zig@v2
+
+      - name: Run the unit tests
+        run: zig build test --summary all
+
+      - name: Build for Android
+        run: zig build android
+
+      - name: Prepare the release files
+        run: |
+          mkdir dist
+          for abi in arm64-v8a x86_64; do
+            cp "zig-out/android/$abi/pdock" "dist/pdock-android-$abi"
+          done
+          (cd dist && sha256sum pdock-android-* > SHA256SUMS)
+
+      - name: Write the release notes
+        run: envsubst '$GITHUB_SHA $GITHUB_SERVER_URL $GITHUB_REPOSITORY $GITHUB_RUN_ID' < .github/release-notes.md > notes.md
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then flags+=(--prerelease); fi
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "PocketDock $VERSION" --notes-file notes.md --generate-notes "${flags[@]}"
