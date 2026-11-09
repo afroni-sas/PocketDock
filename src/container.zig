@@ -20,6 +20,14 @@ const linux = sys.linux;
 pub const PortSpec = struct { container: u16, host: u16 };
 pub const Volume = struct { host: []const u8, guest: []const u8, ro: bool = false };
 
+pub const Health = struct {
+    command: []const []const u8,
+    interval_ms: u64 = 30_000,
+    timeout_ms: u64 = 30_000,
+    start_ms: u64 = 0,
+    retries: u32 = 3,
+};
+
 pub const Config = struct {
     id: []const u8,
     name: []const u8,
@@ -48,6 +56,8 @@ pub const Config = struct {
     pids_limit: u32 = 0,
     /// A stage of `pdock build`, hidden from `ps`.
     builder: bool = false,
+    stop_signal: []const u8 = "SIGTERM",
+    health: ?Health = null,
 };
 
 pub const PortEntry = struct { container: u16, host: u16 };
@@ -63,6 +73,8 @@ pub const State = struct {
     restarts: u32 = 0,
     ports: []const PortEntry = &.{},
     oom_killed: bool = false,
+    /// "starting", "healthy" or "unhealthy"; empty without a health check.
+    health: []const u8 = "",
 };
 
 pub const CreateOptions = struct {
@@ -86,6 +98,9 @@ pub const CreateOptions = struct {
     cpuset: u64 = 0,
     pids_limit: u32 = 0,
     builder: bool = false,
+    stop_signal: ?[]const u8 = null,
+    health: ?Health = null,
+    no_health: bool = false,
 };
 
 /// One RUN instruction of a build.
@@ -191,7 +206,10 @@ pub const Manager = struct {
         var out: std.ArrayList([]const u8) = .empty;
         var id = image_id;
         while (true) {
-            try out.append(self.a, self.store.path(&.{ "images", id, "rootfs" }));
+            const layer = self.store.path(&.{ "images", id, "rootfs" });
+            // The final image of a build holds only its configuration.
+            var p = try Path.of(layer);
+            if (sys.exists(p.z())) try out.append(self.a, layer);
             id = sys.readFileAlloc(self.a, self.store.path(&.{ "images", id, "parent" }), 128) catch break;
         }
         return out.items;
@@ -337,6 +355,7 @@ pub const Manager = struct {
             return error.NoCommand;
         }
 
+        const image_view = try self.imageVfs(opts.image_id);
         const user_str = opts.user orelse blk: {
             const u = img.object.get("User") orelse break :blk "";
             break :blk if (u == .string) u.string else "";
@@ -345,13 +364,46 @@ pub const Manager = struct {
         var gid: u32 = 0;
         var home: []const u8 = "/root";
         if (user_str.len > 0) {
-            const info = try self.resolveUser(try self.imageVfs(opts.image_id), user_str);
+            const info = try self.resolveUser(image_view, user_str);
             uid = info.uid;
             gid = info.gid;
             home = info.home;
         }
 
         const hostname = opts.hostname orelse id[0..12];
+
+        // Paths the image declares as VOLUME get their own storage, starting
+        // from what the image has there, unless -v already provides one.
+        var volumes: std.ArrayList(Volume) = .empty;
+        try volumes.appendSlice(a, opts.volumes);
+        if (!opts.builder) {
+            if (img.object.get("Volumes")) |declared| {
+                if (declared == .object) {
+                    for (declared.object.keys(), 0..) |guest, i| {
+                        var covered = false;
+                        for (opts.volumes) |v| covered = covered or std.mem.eql(u8, v.guest, guest);
+                        if (covered) continue;
+                        const host = self.file(id, try std.fmt.allocPrint(a, "volumes/{d}", .{i}));
+                        try sys.mkdirP(host, 0o755);
+                        try self.seedVolume(image_view, guest, host);
+                        try volumes.append(a, .{ .host = host, .guest = guest });
+                    }
+                }
+            }
+        }
+
+        var stop_signal: []const u8 = opts.stop_signal orelse "";
+        if (stop_signal.len == 0) {
+            if (img.object.get("StopSignal")) |s| {
+                if (s == .string) stop_signal = s.string;
+            }
+        }
+        if (stop_signal.len == 0) stop_signal = "SIGTERM";
+
+        const health: ?Health = if (opts.no_health)
+            null
+        else
+            opts.health orelse try parseHealth(a, img.object.get("Healthcheck"));
         const ip = try self.allocateIp(id);
 
         var env: std.ArrayList([]const u8) = .empty;
@@ -385,7 +437,7 @@ pub const Manager = struct {
             .uid = uid,
             .gid = gid,
             .ports = opts.ports,
-            .volumes = opts.volumes,
+            .volumes = volumes.items,
             .restart = opts.restart,
             .max_retries = opts.max_retries,
             .auto_remove = opts.auto_remove,
@@ -397,6 +449,8 @@ pub const Manager = struct {
             .cpuset = opts.cpuset,
             .pids_limit = opts.pids_limit,
             .builder = opts.builder,
+            .stop_signal = stop_signal,
+            .health = health,
         };
 
         try sys.mkdirP(self.file(id, "run"), 0o755);
@@ -588,6 +642,12 @@ pub const Manager = struct {
         }
     }
 
+    fn onHealth(ctx: ?*anyopaque, status: []const u8) void {
+        const c: *RunCtx = @ptrCast(@alignCast(ctx.?));
+        c.state.health = status;
+        c.mgr.saveState(c.id, c.state.*);
+    }
+
     fn onOom(ctx: ?*anyopaque) void {
         const c: *RunCtx = @ptrCast(@alignCast(ctx.?));
         c.state.oom_killed = true;
@@ -661,6 +721,20 @@ pub const Manager = struct {
         var stdin_fd: i32 = 0;
         if (attach != .tty) stdin_fd = try sys.open("/dev/null", 0, 0);
 
+        var health: ?tracer.HealthSpec = null;
+        if (cfg.health) |h| {
+            // A command missing from the image fails each check, as it should.
+            const path = self.findExecutable(vfs, cfg, h.command[0]) catch try self.a.dupeSentinel(u8, h.command[0], 0);
+            health = .{
+                .exec_path = path,
+                .argv = try self.zList(h.command),
+                .interval_ms = h.interval_ms,
+                .timeout_ms = h.timeout_ms,
+                .start_ms = h.start_ms,
+                .retries = h.retries,
+            };
+        }
+
         var spec: tracer.Spec = .{
             .vfs = vfs,
             .exec_path = exec_path,
@@ -693,6 +767,8 @@ pub const Manager = struct {
             .on_start = onStart,
             .on_ports = onPorts,
             .on_oom = onOom,
+            .health = health,
+            .on_health = onHealth,
         };
 
         var code: u8 = 0;
@@ -770,25 +846,85 @@ pub const Manager = struct {
         return tracer.Tracer.run(self.gpa, &spec);
     }
 
-    /// Turns a finished build stage into an image. Its writable layer moves
+    /// Turns a finished build step into a layer. Its writable layer moves
     /// as it is, so this takes no time and no extra space.
-    pub fn commitBuild(self: *Manager, cfg: *const Config, config_json: []const u8) ![]const u8 {
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update(config_json);
-        hash.update(cfg.id);
-        hash.update(cfg.image_id);
-        var digest: [32]u8 = undefined;
-        hash.final(&digest);
-        const id = try std.fmt.allocPrint(self.a, "{x}", .{&digest});
-
+    pub fn commitLayer(self: *Manager, cfg: *const Config, id: []const u8) !void {
         try sys.mkdirP(self.store.path(&.{ "images", id }), 0o700);
         var from = try Path.of(self.file(cfg.id, "upper"));
         var to = try Path.of(self.store.path(&.{ "images", id, "rootfs" }));
         try sys.rename(from.z(), to.z());
-        try sys.writeFile(self.store.path(&.{ "images", id, "config.json" }), config_json, 0o600);
+        try sys.writeFile(self.store.path(&.{ "images", id, "config.json" }), "{\"config\":{}}", 0o600);
         try sys.writeFile(self.store.path(&.{ "images", id, "parent" }), cfg.image_id, 0o600);
         self.removeFiles(cfg.id);
+    }
+
+    /// Records an image: settings on top of layers that already exist.
+    pub fn commitImage(self: *Manager, parent: []const u8, config_json: []const u8) ![]const u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(config_json);
+        hash.update(parent);
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        const id = try std.fmt.allocPrint(self.a, "{x}", .{&digest});
+        try sys.mkdirP(self.store.path(&.{ "images", id }), 0o700);
+        try sys.writeFile(self.store.path(&.{ "images", id, "config.json" }), config_json, 0o600);
+        try sys.writeFile(self.store.path(&.{ "images", id, "parent" }), parent, 0o600);
         return id;
+    }
+
+    /// Deletes build layers that no tagged image or container uses.
+    pub fn prune(self: *Manager) !u64 {
+        var keep: std.StringHashMapUnmanaged(void) = .empty;
+        var roots: std.ArrayList([]const u8) = .empty;
+        for (try self.store.listRefs()) |r| try roots.append(self.a, r.id);
+        for (try self.listIds()) |id| {
+            const cfg = self.loadConfig(id) catch continue;
+            try roots.append(self.a, cfg.image_id);
+        }
+        for (roots.items) |root| {
+            var id = root;
+            while (true) {
+                try keep.put(self.a, id, {});
+                id = sys.readFileAlloc(self.a, self.store.path(&.{ "images", id, "parent" }), 128) catch break;
+            }
+        }
+        var removed: u64 = 0;
+        for (try self.store.listDir("images")) |id| {
+            var parent = try Path.of(self.store.path(&.{ "images", id, "parent" }));
+            // Only built images have a parent; pulled ones are left alone.
+            if (keep.contains(id) or !sys.exists(parent.z())) continue;
+            try sys.rmrf(self.store.path(&.{ "images", id }));
+            removed += 1;
+        }
+        return removed;
+    }
+
+    /// Gives a new volume what the image has at that path.
+    fn seedVolume(self: *Manager, image: *vfs_mod.Vfs, guest: []const u8, host: []const u8) !void {
+        var r: vfs_mod.Resolved = .{};
+        image.resolve(guest, true, &r) catch return;
+        if (!r.exists or !sys.isDir(r.mode)) return;
+        var it = try sys.DirIter.open_(r.host.z());
+        defer it.deinit();
+        while (try it.next()) |ent| {
+            const child_guest = try std.fmt.allocPrint(self.a, "{s}/{s}", .{ std.mem.trimEnd(u8, guest, "/"), ent.name });
+            var dst = try Path.join(host, "/");
+            try dst.append(ent.name);
+            var cr: vfs_mod.Resolved = .{};
+            try image.resolve(child_guest, false, &cr);
+            if (!cr.exists) continue;
+            if (sys.isDir(cr.mode)) {
+                try sys.mkdir(dst.z(), (cr.mode & 0o7777) | 0o700);
+                try self.seedVolume(image, child_guest, dst.slice());
+            } else if (sys.isLnk(cr.mode)) {
+                var buf: [sys.PATH_MAX]u8 = undefined;
+                const target = try sys.readlink(cr.host.z(), buf[0 .. buf.len - 1]);
+                buf[target.len] = 0;
+                try sys.symlink(@ptrCast(&buf), dst.z());
+            } else {
+                try vfs_mod.Vfs.copyFile(cr.host.z(), dst.z());
+            }
+        }
     }
 
     pub fn discardBuild(self: *Manager, id: []const u8) void {
@@ -898,7 +1034,8 @@ pub const Manager = struct {
         const st = try self.loadState(id);
         if (!std.mem.eql(u8, st.status, "running") and !std.mem.eql(u8, st.status, "restarting")) return;
         try sys.writeFile(self.file(id, "stop-requested"), "", 0o600);
-        if (st.pid > 0) _ = linux.kill(st.pid, .TERM);
+        const cfg = try self.loadConfig(id);
+        if (st.pid > 0) _ = linux.kill(st.pid, parseSignal(cfg.stop_signal));
         var waited: u32 = 0;
         while (waited < timeout_s * 10) : (waited += 1) {
             const now = try self.loadState(id);
@@ -953,6 +1090,51 @@ pub const Manager = struct {
         return false;
     }
 };
+
+/// Accepts `SIGTERM`, `TERM` or a signal number.
+pub fn parseSignal(name: []const u8) linux.SIG {
+    if (std.fmt.parseInt(u32, name, 10) catch null) |n| return @fromBackingInt(n);
+    var buf: [16]u8 = undefined;
+    if (name.len > buf.len) return .TERM;
+    const upper = std.ascii.upperString(&buf, name);
+    const bare = if (std.mem.startsWith(u8, upper, "SIG")) upper[3..] else upper;
+    return std.meta.stringToEnum(linux.SIG, bare) orelse .TERM;
+}
+
+/// Reads an OCI `Healthcheck` object. Times are in nanoseconds there.
+fn parseHealth(a: Allocator, v: ?std.json.Value) !?Health {
+    const val = v orelse return null;
+    if (val != .object) return null;
+    const test_cmd = try stringArray(a, val.object.get("Test"));
+    if (test_cmd.len == 0 or std.mem.eql(u8, test_cmd[0], "NONE")) return null;
+    var h: Health = .{ .command = &.{} };
+    if (std.mem.eql(u8, test_cmd[0], "CMD-SHELL")) {
+        if (test_cmd.len < 2) return null;
+        const argv = try a.alloc([]const u8, 3);
+        argv[0] = "/bin/sh";
+        argv[1] = "-c";
+        argv[2] = test_cmd[1];
+        h.command = argv;
+    } else if (std.mem.eql(u8, test_cmd[0], "CMD")) {
+        if (test_cmd.len < 2) return null;
+        h.command = test_cmd[1..];
+    } else {
+        return null;
+    }
+    const ms = struct {
+        fn f(o: std.json.ObjectMap, key: []const u8) u64 {
+            const x = o.get(key) orelse return 0;
+            return if (x == .integer and x.integer > 0) @as(u64, @intCast(x.integer)) / std.time.ns_per_ms else 0;
+        }
+    }.f;
+    if (ms(val.object, "Interval") != 0) h.interval_ms = ms(val.object, "Interval");
+    if (ms(val.object, "Timeout") != 0) h.timeout_ms = ms(val.object, "Timeout");
+    h.start_ms = ms(val.object, "StartPeriod");
+    if (val.object.get("Retries")) |r| {
+        if (r == .integer and r.integer > 0) h.retries = @intCast(r.integer);
+    }
+    return h;
+}
 
 fn parseIp(s: []const u8) [4]u8 {
     var out: [4]u8 = .{ 0, 0, 0, 0 };

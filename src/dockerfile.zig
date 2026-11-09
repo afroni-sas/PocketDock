@@ -264,6 +264,35 @@ pub fn parseIgnore(a: Allocator, text: []const u8) ![]const []const u8 {
     return out.items;
 }
 
+/// Parses a duration like `1m30s`, `5s` or `500ms` into milliseconds.
+pub fn parseDuration(s: []const u8) ?u64 {
+    if (s.len == 0) return null;
+    var total: u64 = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        var j = i;
+        while (j < s.len and std.ascii.isDigit(s[j])) j += 1;
+        if (j == i) return null;
+        const n = std.fmt.parseInt(u64, s[i..j], 10) catch return null;
+        var k = j;
+        while (k < s.len and std.ascii.isAlphabetic(s[k])) k += 1;
+        const unit = s[j..k];
+        const mult: u64 = if (std.mem.eql(u8, unit, "ms"))
+            1
+        else if (std.mem.eql(u8, unit, "s"))
+            1000
+        else if (std.mem.eql(u8, unit, "m"))
+            60_000
+        else if (std.mem.eql(u8, unit, "h"))
+            3_600_000
+        else
+            return null;
+        total += n * mult;
+        i = k;
+    }
+    return total;
+}
+
 const testing = std.testing;
 
 fn arena() std.heap.ArenaAllocator {
@@ -337,4 +366,11 @@ test "globMatch and ignore rules" {
     try testing.expect(isIgnored(&rules, "a.log"));
     try testing.expect(!isIgnored(&rules, "keep.log"));
     try testing.expect(!isIgnored(&rules, "src/a.js"));
+}
+
+test "parseDuration combines units" {
+    try testing.expectEqual(@as(?u64, 90_000), parseDuration("1m30s"));
+    try testing.expectEqual(@as(?u64, 500), parseDuration("500ms"));
+    try testing.expectEqual(@as(?u64, null), parseDuration("5"));
+    try testing.expectEqual(@as(?u64, null), parseDuration("abc"));
 }

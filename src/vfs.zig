@@ -83,6 +83,9 @@ pub const Vfs = struct {
     work_seq: u32 = 0,
     /// Treat `/proc` as an ordinary directory (when unpacking images).
     raw: bool = false,
+    /// Where paths were last found among the read-only layers. They never
+    /// change, so with many layers this spares a search on every lookup.
+    level_cache: [512]struct { hash: u64 = 0, level: u16 = 0 } = @splat(.{}),
 
     pub fn mountFor(self: *const Vfs, canon: []const u8) ?*const Mount {
         var best: ?*const Mount = null;
@@ -117,7 +120,16 @@ pub const Vfs = struct {
             return .mount;
         }
         var level = cur;
+        var hash: u64 = 0;
+        var slot: ?*@TypeOf(self.level_cache[0]) = null;
         while (level < self.levels()) : (level += 1) {
+            if (level > cur and slot == null) {
+                // The first lookup, in the writable layer, always has to
+                // happen. Only the search further down can be skipped.
+                hash = std.hash.Wyhash.hash(0, canon) | 1;
+                slot = &self.level_cache[hash % self.level_cache.len];
+                if (slot.?.hash == hash and slot.?.level >= level) level = slot.?.level;
+            }
             try host.set(self.layer(level));
             try host.append(canon);
             sys.lstat(host.z(), st) catch {
@@ -126,6 +138,7 @@ pub const Vfs = struct {
                 continue;
             };
             if (isStub(st)) continue;
+            if (slot) |s| s.* = .{ .hash = hash, .level = @intCast(level) };
             level_out.* = level;
             return .layer;
         }

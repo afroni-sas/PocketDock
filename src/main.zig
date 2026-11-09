@@ -10,6 +10,7 @@ const builder = @import("builder.zig");
 const doctor = @import("doctor.zig");
 const container = @import("container.zig");
 const quota = @import("quota.zig");
+const dockerfile = @import("dockerfile.zig");
 const Store = @import("store.zig").Store;
 const Manager = container.Manager;
 const Allocator = std.mem.Allocator;
@@ -40,6 +41,13 @@ const usage =
     \\      --cpus N                       CPU quota, e.g. 0.5
     \\      --cpuset-cpus LIST             Usable CPUs, e.g. 0-3,6
     \\      --pids-limit N                 Maximum processes and threads
+    \\      --stop-signal SIGNAL           Signal sent by stop
+    \\      --health-cmd CMD               Command that checks the container
+    \\      --health-interval TIME         Time between checks, e.g. 30s
+    \\      --health-timeout TIME          Time a check may take
+    \\      --health-retries N             Failures before unhealthy
+    \\      --health-start-period TIME     Grace period after starting
+    \\      --no-healthcheck               Ignore the image's health check
     \\  start NAME          Start a stopped container
     \\  stop [-t SEC] NAME  Stop a container
     \\  restart NAME        Restart a container
@@ -55,8 +63,10 @@ const usage =
     \\      -t, --tag NAME                 Name the image
     \\      -f, --file PATH                Dockerfile to use
     \\      --build-arg KEY=VALUE          Set a build argument
+    \\      --no-cache                     Run every step again
     \\  pull IMAGE          Download an image
     \\  images              List images
+    \\  prune               Delete build layers nothing uses any more
     \\  rmi IMAGE           Remove an image
     \\
     \\System
@@ -136,6 +146,7 @@ pub fn main(init: std.process.Init) !void {
         .{ "pull", cmdPull },
         .{ "images", cmdImages },
         .{ "rmi", cmdRmi },
+        .{ "prune", cmdPrune },
     };
     inline for (commands) |c| {
         if (std.mem.eql(u8, cmd, c[0])) {
@@ -171,6 +182,8 @@ fn cmdBuild(c: *Ctx, args: []const [:0]const u8) !void {
             } else {
                 try build_args.append(c.a, v);
             }
+        } else if (eql(o, "--no-cache")) {
+            opts.no_cache = true;
         } else if (o.len > 0 and o[0] == '-') {
             die("unknown option \"{s}\" for build", .{o});
         } else {
@@ -182,6 +195,10 @@ fn cmdBuild(c: *Ctx, args: []const [:0]const u8) !void {
         if (e == error.BuildFailed) sys.linux.exit_group(1);
         return e;
     };
+}
+
+fn cmdPrune(c: *Ctx, _: []const [:0]const u8) !void {
+    sys.print("Removed {d} unused layers\n", .{try c.mgr.prune()});
 }
 
 fn cmdPull(c: *Ctx, args: []const [:0]const u8) !void {
@@ -223,6 +240,7 @@ fn cmdRun(c: *Ctx, args: []const [:0]const u8) !void {
     var detach = false;
     var tty = false;
     var i: usize = 0;
+    var health: container.Health = .{ .command = &.{} };
 
     const value = struct {
         fn f(a: []const [:0]const u8, idx: *usize) []const u8 {
@@ -277,6 +295,29 @@ fn cmdRun(c: *Ctx, args: []const [:0]const u8) !void {
         } else if (eql(o, "--pids-limit")) {
             const v = value(args, &i);
             opts.pids_limit = std.fmt.parseInt(u32, v, 10) catch die("invalid pids limit \"{s}\"", .{v});
+        } else if (eql(o, "--stop-signal")) {
+            opts.stop_signal = value(args, &i);
+        } else if (eql(o, "--no-healthcheck")) {
+            opts.no_health = true;
+        } else if (eql(o, "--health-cmd")) {
+            const argv = try c.a.alloc([]const u8, 3);
+            argv[0] = "/bin/sh";
+            argv[1] = "-c";
+            argv[2] = value(args, &i);
+            health.command = argv;
+        } else if (eql(o, "--health-interval") or eql(o, "--health-timeout") or eql(o, "--health-start-period")) {
+            const v = value(args, &i);
+            const ms = dockerfile.parseDuration(v) orelse die("invalid duration \"{s}\"", .{v});
+            if (eql(o, "--health-interval")) {
+                health.interval_ms = ms;
+            } else if (eql(o, "--health-timeout")) {
+                health.timeout_ms = ms;
+            } else {
+                health.start_ms = ms;
+            }
+        } else if (eql(o, "--health-retries")) {
+            const v = value(args, &i);
+            health.retries = std.fmt.parseInt(u32, v, 10) catch die("invalid retries \"{s}\"", .{v});
         } else if (eql(o, "--restart")) {
             const v = value(args, &i);
             const colon = std.mem.indexOfScalar(u8, v, ':');
@@ -300,6 +341,7 @@ fn cmdRun(c: *Ctx, args: []const [:0]const u8) !void {
     opts.image = (try registry.parseRef(c.a, image)).name;
     opts.image_id = image_id;
     opts.command = command;
+    if (health.command.len > 0) opts.health = health;
     opts.env = env.items;
     opts.ports = ports.items;
     opts.volumes = vols.items;
@@ -382,7 +424,12 @@ fn cmdPs(c: *Ctx, args: []const [:0]const u8) !void {
         const running = eql(st.status, "running") or eql(st.status, "restarting");
         if (!all and !running) continue;
         const status = if (eql(st.status, "running"))
-            try std.fmt.allocPrint(c.a, "Up {s}", .{since(c.a, st.started_at)})
+            try std.fmt.allocPrint(c.a, "Up {s}{s}{s}{s}", .{
+                since(c.a, st.started_at),
+                if (st.health.len > 0) " (" else "",
+                st.health,
+                if (st.health.len > 0) ")" else "",
+            })
         else if (eql(st.status, "exited"))
             try std.fmt.allocPrint(c.a, "Exited ({d})", .{st.exit_code})
         else
@@ -490,7 +537,7 @@ fn cmdRmi(c: *Ctx, args: []const [:0]const u8) !void {
     if (args.len != 1) die("usage: pdock rmi IMAGE", .{});
     const ref = try registry.parseRef(c.a, args[0]);
     const id = c.store.getRef(ref.name) orelse die("no such image: {s}", .{args[0]});
-    if (try c.mgr.imageInUse(id)) die("image is used by a container or another image; remove that first", .{});
+    if (try c.mgr.imageInUse(id)) die("image is used by a container or another image; remove that first, or run pdock prune", .{});
     c.store.unsetRef(ref.name);
     for (try c.store.listRefs()) |r| {
         if (eql(r.id, id)) {
