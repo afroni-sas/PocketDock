@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine:
+    name: Unit tests and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Takes the version from minimum_zig_version in build.zig.zon.
+      - uses: mlugg/setup-zig@v2
+
+      - name: Run the unit tests
+        run: zig build test --summary all
+
+      - name: Build for Android
+        run: zig build android
+
+      - name: Build for this machine
+        run: zig build --release
+
+      - name: Run a real container
+        run: ./zig-out/bin/pdock run --rm alpine:3.20 sh -c 'test "$$" = 1 && cat /etc/alpine-release'
+
+      - name: Upload the Android binaries
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdock-android
+          path: zig-out/android
+          retention-days: 14
+
+  scripts:
+    name: Script syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the install script
+        run: |
+          sh -n install.sh
+          shellcheck install.sh
