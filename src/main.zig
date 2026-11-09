@@ -6,6 +6,7 @@ const sys = @import("sys.zig");
 const arch = @import("arch.zig");
 const dns = @import("dns.zig");
 const registry = @import("registry.zig");
+const builder = @import("builder.zig");
 const doctor = @import("doctor.zig");
 const container = @import("container.zig");
 const quota = @import("quota.zig");
@@ -50,6 +51,10 @@ const usage =
     \\  inspect NAME        Print a container's configuration and state as JSON
     \\
     \\Images
+    \\  build [options] [DIR]              Build an image from a Dockerfile
+    \\      -t, --tag NAME                 Name the image
+    \\      -f, --file PATH                Dockerfile to use
+    \\      --build-arg KEY=VALUE          Set a build argument
     \\  pull IMAGE          Download an image
     \\  images              List images
     \\  rmi IMAGE           Remove an image
@@ -127,6 +132,7 @@ pub fn main(init: std.process.Init) !void {
         .{ "logs", cmdLogs },
         .{ "exec", cmdExec },
         .{ "inspect", cmdInspect },
+        .{ "build", cmdBuild },
         .{ "pull", cmdPull },
         .{ "images", cmdImages },
         .{ "rmi", cmdRmi },
@@ -145,6 +151,37 @@ pub fn main(init: std.process.Init) !void {
 
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+fn cmdBuild(c: *Ctx, args: []const [:0]const u8) !void {
+    var opts: builder.Options = .{ .context = "." };
+    var build_args: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const o: []const u8 = args[i];
+        const takes_value = eql(o, "-t") or eql(o, "--tag") or eql(o, "-f") or eql(o, "--file") or eql(o, "--build-arg");
+        if (takes_value) {
+            i += 1;
+            if (i >= args.len) die("option {s} needs a value", .{o});
+            const v: []const u8 = args[i];
+            if (eql(o, "-t") or eql(o, "--tag")) {
+                opts.tag = v;
+            } else if (eql(o, "-f") or eql(o, "--file")) {
+                opts.file = v;
+            } else {
+                try build_args.append(c.a, v);
+            }
+        } else if (o.len > 0 and o[0] == '-') {
+            die("unknown option \"{s}\" for build", .{o});
+        } else {
+            opts.context = o;
+        }
+    }
+    opts.build_args = build_args.items;
+    _ = builder.build(c.a, c.gpa, c.io, c.store, c.mgr, opts) catch |e| {
+        if (e == error.BuildFailed) sys.linux.exit_group(1);
+        return e;
+    };
 }
 
 fn cmdPull(c: *Ctx, args: []const [:0]const u8) !void {
@@ -341,6 +378,7 @@ fn cmdPs(c: *Ctx, args: []const [:0]const u8) !void {
     for (try c.mgr.listIds()) |id| {
         const cfg = c.mgr.loadConfig(id) catch continue;
         const st = c.mgr.loadState(id) catch continue;
+        if (cfg.builder) continue;
         const running = eql(st.status, "running") or eql(st.status, "restarting");
         if (!all and !running) continue;
         const status = if (eql(st.status, "running"))
@@ -452,7 +490,7 @@ fn cmdRmi(c: *Ctx, args: []const [:0]const u8) !void {
     if (args.len != 1) die("usage: pdock rmi IMAGE", .{});
     const ref = try registry.parseRef(c.a, args[0]);
     const id = c.store.getRef(ref.name) orelse die("no such image: {s}", .{args[0]});
-    if (try c.mgr.imageInUse(id)) die("image is used by a container; remove the container first", .{});
+    if (try c.mgr.imageInUse(id)) die("image is used by a container or another image; remove that first", .{});
     c.store.unsetRef(ref.name);
     for (try c.store.listRefs()) |r| {
         if (eql(r.id, id)) {
