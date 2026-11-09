@@ -2334,7 +2334,10 @@ fn routeOut(c: *Ctx, fam: u16, sa: []u8) Err!bool {
 
     if (v6_lo or wildcard or (ip4 != null and ip4.?[0] == 127)) {
         // Loopback is private to the container, as in a network namespace.
-        const m = tr.findPort(port) orelse return sys.fail(.CONNREFUSED);
+        // A port nobody bound goes to one that is always closed, rather than
+        // failing here: connect() on a UDP socket must succeed all the same,
+        // and musl's getaddrinfo relies on that to test for a network.
+        const m = tr.findPort(port) orelse PortMap{ .container = port, .host = 1, .fixed = false };
         setPort(sa, m.host);
         if (wildcard) setLoopback(fam, sa);
         if (v6_lo and m.kind == .dual) setLoopback(fam, sa);
