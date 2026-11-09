@@ -7,6 +7,19 @@ language runs unchanged. It is a single static binary with no dependencies.
 PocketDock is the engine of a self-hosted, Railway-style platform for Android.
 The control panel will be built on top of it.
 
+## Install
+
+In Termux, or on Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/afroni-sas/PocketDock/main/install.sh | sh
+```
+
+The script picks the binary for your CPU, checks its checksum and puts
+`pdock` on your PATH. Binaries are also attached to each
+[release](https://github.com/afroni-sas/PocketDock/releases), for 64-bit ARM
+(`arm64-v8a`) and `x86_64` devices.
+
 ## Why not Docker?
 
 Docker relies on kernel features that an unprivileged Android app cannot use:
