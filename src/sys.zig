@@ -401,6 +401,60 @@ pub fn pidAlive(pid: i32) bool {
     return linux.errno(linux.kill(pid, @fromBackingInt(0))) != .SRCH;
 }
 
+/// When a process started, in clock ticks since boot; 0 if that cannot be read.
+pub fn procStart(pid: i32) u64 {
+    var name: [32]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&name, "/proc/{d}/stat", .{pid}, 0) catch return 0;
+    const fd = open(path.ptr, O_CLOEXEC, 0) catch return 0;
+    defer close(fd);
+    var buf: [1024]u8 = undefined;
+    const n = readFull(fd, &buf) catch return 0;
+    // The process name, in parentheses, may itself hold spaces.
+    const paren = std.mem.lastIndexOfScalar(u8, buf[0..n], ')') orelse return 0;
+    var it = std.mem.tokenizeScalar(u8, buf[paren + 1 .. n], ' ');
+    var i: usize = 0;
+    while (it.next()) |f| : (i += 1) {
+        if (i == 19) return std.fmt.parseInt(u64, f, 10) catch 0;
+    }
+    return 0;
+}
+
+/// Whether `pid` is still the process that started at `start`. A pid alone
+/// proves nothing after a reboot, when numbers are handed out again.
+pub fn sameProcess(pid: i32, start: u64) bool {
+    if (!pidAlive(pid)) return false;
+    if (start == 0) return true;
+    const now = procStart(pid);
+    return now == 0 or now == start;
+}
+
+/// `path` with every symlink resolved.
+pub fn realpath(a: std.mem.Allocator, path: []const u8) ![]u8 {
+    var p = try Path.of(path);
+    const fd = try open(p.z(), O_PATH | O_CLOEXEC, 0);
+    defer close(fd);
+    var name: [32]u8 = undefined;
+    const link = std.fmt.bufPrintSentinel(&name, "/proc/self/fd/{d}", .{fd}, 0) catch unreachable;
+    var buf: [PATH_MAX]u8 = undefined;
+    return a.dupe(u8, try readlink(link.ptr, &buf));
+}
+
+pub const Pty = struct { master: i32, slave: i32 };
+
+pub fn openPty() Err!Pty {
+    const TIOCGPTN: u32 = 0x80045430;
+    const TIOCSPTLCK: u32 = 0x40045431;
+    const master = try open("/dev/ptmx", O_RDWR | O_NOCTTY | O_CLOEXEC, 0);
+    errdefer close(master);
+    var unlock: i32 = 0;
+    _ = try ck(linux.ioctl(master, TIOCSPTLCK, @intFromPtr(&unlock)));
+    var n: u32 = 0;
+    _ = try ck(linux.ioctl(master, TIOCGPTN, @intFromPtr(&n)));
+    var name: [32]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&name, "/dev/pts/{d}", .{n}, 0) catch unreachable;
+    return .{ .master = master, .slave = try open(path.ptr, O_RDWR | O_NOCTTY | O_CLOEXEC, 0) };
+}
+
 pub fn nowNs() i128 {
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(.REALTIME, &ts);

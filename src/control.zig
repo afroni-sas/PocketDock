@@ -11,6 +11,8 @@ const linux = sys.linux;
 const Err = sys.Err;
 
 pub const op_exec: u8 = 'x';
+/// `exec` whose stdio is a terminal the new process should control.
+pub const op_exec_tty: u8 = 'X';
 pub const op_stats: u8 = 's';
 
 const Iov = extern struct { base: usize, len: usize };

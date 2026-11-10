@@ -110,6 +110,9 @@ const Client = struct {
 
         var req = try self.http.request(.GET, uri, .{
             .redirect_behavior = .unhandled,
+            // A registry drops idle connections during a long download, and
+            // retrying on the same dead one would fail every time.
+            .keep_alive = false,
             .headers = .{
                 .accept_encoding = .omit,
                 .user_agent = .{ .override = "pocketdock/0.1" },

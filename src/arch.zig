@@ -143,6 +143,18 @@ pub fn setRet(r: *Regs, v: i64) void {
     if (builtin.cpu.arch == .x86_64) r.rax = @bitCast(v) else r.regs[0] = @bitCast(v);
 }
 
+/// Puts a guest back on the syscall instruction it has just executed, ready
+/// to make syscall `nr` when it runs.
+pub fn rewindSyscall(r: *Regs, nr: u64) void {
+    if (builtin.cpu.arch == .x86_64) {
+        r.rip -= 2;
+        r.rax = nr;
+    } else {
+        r.pc -= 4;
+        r.regs[8] = nr;
+    }
+}
+
 pub fn sp(r: *const Regs) u64 {
     return if (builtin.cpu.arch == .x86_64) r.rsp else r.sp;
 }

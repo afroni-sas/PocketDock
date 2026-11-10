@@ -72,6 +72,12 @@ pub const H = enum(u8) {
     setsockopt,
     sysinfo,
     affinity,
+    shmget,
+    shmat,
+    shmdt,
+    shmctl,
+    ioctl_pgrp,
+    prctl_caps,
 };
 
 pub const Sc = struct {
@@ -237,6 +243,13 @@ fn build() [max_nr]Sc {
     add(&t, "sendmsg", .{ .h = .sendmsg });
     add(&t, "sendmmsg", .{ .h = .sendmmsg });
     add(&t, "setsockopt", .{ .h = .setsockopt });
+
+    add(&t, "shmget", .{ .h = .shmget });
+    add(&t, "shmat", .{ .h = .shmat });
+    add(&t, "shmdt", .{ .h = .shmdt });
+    add(&t, "shmctl", .{ .h = .shmctl });
+    add(&t, "ioctl", .{ .h = .ioctl_pgrp });
+    add(&t, "prctl", .{ .h = .prctl_caps });
 
     add(&t, "mount", .{ .h = .eperm });
     add(&t, "umount2", .{ .h = .eperm });

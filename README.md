@@ -67,6 +67,8 @@ device's kernel allows. Data lives in `~/.pocketdock`, or `$POCKETDOCK_ROOT`.
 | **Network** | A private IP and name; see below. |
 | **Hostname, DNS** | Per container. |
 | **Limits** | Memory, CPU and process count; see below. |
+| **Terminals** | `-it` gives a real pseudo-terminal, with job control, `Ctrl-C` and window resizing. |
+| **Shared memory** | System V segments are emulated, because Android forbids them to apps. PostgreSQL needs them to start. |
 | **Lifecycle** | Restart policies, timestamped logs in the CRI format, `exec`, exit codes, `stats`. |
 
 ### Network
@@ -144,6 +146,26 @@ on the phone does not copy the image.
 - `HEALTHCHECK` runs inside the container; `pdock ps` shows `healthy` or
   `unhealthy`. The `--health-*` options of `run` override it.
 
+## Keeping containers alive on a phone
+
+Each container has a supervisor that applies its restart policy. If Android
+kills the supervisor itself (a reboot, low memory, the phantom process killer),
+only the daemon can bring the container back:
+
+```sh
+pdock daemon -d        # start it now
+pdock daemon install   # and at every boot, through the Termux:Boot app
+```
+
+It revives containers started with `--restart always`, `unless-stopped` or
+`on-failure`. A container you stopped yourself stays stopped. Under Termux it
+also takes a wake lock so that the CPU keeps running; `--no-wake-lock` leaves
+that to you.
+
+`pdock doctor` says whether the daemon runs, whether it starts on boot, and
+whether Android 12+ is still limiting child processes, with the `adb` commands
+that lift the limit. Set Termux's battery use to Unrestricted as well.
+
 ## How the filesystem works
 
 The image is unpacked once and never modified. When a container first writes
@@ -165,6 +187,9 @@ writable layer can itself become a read-only layer of a new image, which is how
 | [src/builder.zig](src/builder.zig), [src/dockerfile.zig](src/dockerfile.zig) | `pdock build` and Dockerfile parsing |
 | [src/container.zig](src/container.zig) | Lifecycle, supervision, logs |
 | [src/control.zig](src/control.zig) | The channel used by `exec` and `stats` |
+| [src/daemon.zig](src/daemon.zig) | Revives containers whose supervisor was killed |
+| [src/tty.zig](src/tty.zig) | The user's side of `-it` |
+| [src/sysv.zig](src/sysv.zig) | Emulated System V shared memory |
 | [src/quota.zig](src/quota.zig) | Resource accounting and limit parsing |
 | [src/dns.zig](src/dns.zig) | DNS through Android's resolver daemon |
 

@@ -8,6 +8,7 @@ const dns = @import("dns.zig");
 const registry = @import("registry.zig");
 const builder = @import("builder.zig");
 const doctor = @import("doctor.zig");
+const daemon = @import("daemon.zig");
 const container = @import("container.zig");
 const quota = @import("quota.zig");
 const dockerfile = @import("dockerfile.zig");
@@ -26,6 +27,7 @@ const usage =
     \\  run [options] IMAGE [COMMAND...]   Create and start a container
     \\      -d, --detach                   Run in the background
     \\      -it, -t                        Attach a terminal
+    \\      -i, --interactive              Keep stdin open, without a terminal
     \\      --name NAME                    Name the container
     \\      -e, --env KEY=VALUE            Set an environment variable
     \\      -p, --publish [HOST:]PORT      Publish a container port
@@ -37,6 +39,7 @@ const usage =
     \\      --restart POLICY               no, always, on-failure[:N], unless-stopped
     \\      --rm                           Remove the container when it exits
     \\      --network MODE                 bridge (default), private or none
+    \\      --host-gateway                 Reach the phone's loopback at 10.88.0.1
     \\      -m, --memory SIZE              Memory limit, e.g. 512m or 2g
     \\      --cpus N                       CPU quota, e.g. 0.5
     \\      --cpuset-cpus LIST             Usable CPUs, e.g. 0-3,6
@@ -71,6 +74,9 @@ const usage =
     \\
     \\System
     \\  doctor              Report what this device's kernel allows
+    \\  daemon [-d]         Bring back containers whose supervisor was killed
+    \\      --no-wake-lock                 Let the CPU sleep (Termux)
+    \\  daemon install      Start the daemon when the phone boots (Termux:Boot)
     \\  version
     \\
     \\Environment: POCKETDOCK_ROOT (data directory), POCKETDOCK_DNS, POCKETDOCK_TRACE
@@ -115,10 +121,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const root = try dataRoot(arena, init.environ_map);
-    try sys.mkdirP(root, 0o700);
+    const wanted_root = try dataRoot(arena, init.environ_map);
+    try sys.mkdirP(wanted_root, 0o700);
+    // The kernel names open files by their real path, which the tracer has to
+    // recognise, so a symlink anywhere in the root would break that.
+    const root = sys.realpath(arena, wanted_root) catch wanted_root;
 
-    if (std.mem.eql(u8, cmd, "doctor")) return doctor.run(root);
+    if (std.mem.eql(u8, cmd, "doctor")) return doctor.run(arena, root, init.environ_map);
+    if (std.mem.eql(u8, cmd, "daemon")) return cmdDaemon(arena, init.gpa, root, rest, init.environ_map);
 
     const io = dns.wrapIo(init.io, init.environ_map.get("POCKETDOCK_DNS"));
     const store = try Store.init(arena, root);
@@ -158,6 +168,41 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     die("unknown command \"{s}\" (try: pdock help)", .{cmd});
+}
+
+fn cmdDaemon(a: Allocator, gpa: Allocator, root: []const u8, args: []const [:0]const u8, env: *std.process.Environ.Map) !void {
+    _ = try Store.init(a, root);
+    if (args.len == 1 and eql(args[0], "install")) {
+        daemon.install(a, root, env) catch |e| {
+            if (e == error.Sys) die("daemon install: {s}", .{@tagName(sys.last)});
+            sys.linux.exit_group(1);
+        };
+        return;
+    }
+    var opts: daemon.Options = .{};
+    for (args) |o| {
+        if (eql(o, "-d") or eql(o, "--detach")) {
+            opts.detach = true;
+        } else if (eql(o, "--no-wake-lock")) {
+            opts.wake_lock = false;
+        } else {
+            die("unknown option \"{s}\" for daemon", .{o});
+        }
+    }
+    // A revived container starts from this environment, not the user's shell.
+    var list: std.ArrayList(?[*:0]const u8) = .empty;
+    const forwarded = [_][]const u8{ "POCKETDOCK_DNS", "HOME", "PATH", "PREFIX" };
+    for (forwarded) |name| {
+        const v = env.get(name) orelse continue;
+        try list.append(a, try std.fmt.allocPrintSentinel(a, "{s}={s}", .{ name, v }, 0));
+    }
+    try list.append(a, try std.fmt.allocPrintSentinel(a, "POCKETDOCK_ROOT={s}", .{root}, 0));
+    try list.append(a, null);
+    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(list.items.ptr);
+    daemon.run(a, gpa, root, envp, opts) catch |e| {
+        if (e == error.AlreadyRunning) sys.linux.exit_group(1);
+        die("daemon: {s}", .{@errorName(e)});
+    };
 }
 
 fn eql(a: []const u8, b: []const u8) bool {
@@ -239,6 +284,7 @@ fn cmdRun(c: *Ctx, args: []const [:0]const u8) !void {
     var vols: std.ArrayList(container.Volume) = .empty;
     var detach = false;
     var tty = false;
+    var interactive = false;
     var i: usize = 0;
     var health: container.Health = .{ .command = &.{} };
 
@@ -258,7 +304,7 @@ fn cmdRun(c: *Ctx, args: []const [:0]const u8) !void {
         } else if (eql(o, "-it") or eql(o, "-ti") or eql(o, "-t") or eql(o, "--tty")) {
             tty = true;
         } else if (eql(o, "-i") or eql(o, "--interactive")) {
-            tty = true;
+            interactive = true;
         } else if (eql(o, "--rm")) {
             opts.auto_remove = true;
         } else if (eql(o, "--name")) {
@@ -283,6 +329,8 @@ fn cmdRun(c: *Ctx, args: []const [:0]const u8) !void {
             const v = value(args, &i);
             if (!eql(v, "bridge") and !eql(v, "private") and !eql(v, "none")) die("invalid network \"{s}\"", .{v});
             opts.network = v;
+        } else if (eql(o, "--host-gateway")) {
+            opts.host_gateway = true;
         } else if (eql(o, "-m") or eql(o, "--memory")) {
             const v = value(args, &i);
             opts.memory = quota.parseSize(v) orelse die("invalid memory size \"{s}\"", .{v});
@@ -347,7 +395,7 @@ fn cmdRun(c: *Ctx, args: []const [:0]const u8) !void {
     opts.volumes = vols.items;
 
     const cfg = try c.mgr.create(opts);
-    const attach: container.Attach = if (detach) .detached else if (tty) .tty else .foreground;
+    const attach: container.Attach = if (detach) .detached else if (tty) .tty else if (interactive) .interactive else .foreground;
     const code = try c.mgr.start(cfg.id, attach);
     if (detach) {
         sys.print("{s}\n", .{cfg.id});
@@ -502,8 +550,10 @@ fn cmdExec(c: *Ctx, args: []const [:0]const u8) !void {
     while (i < args.len) : (i += 1) {
         const o: []const u8 = args[i];
         if (o.len == 0 or o[0] != '-') break;
-        if (eql(o, "-it") or eql(o, "-ti") or eql(o, "-t") or eql(o, "-i")) {
+        if (eql(o, "-it") or eql(o, "-ti") or eql(o, "-t") or eql(o, "--tty")) {
             tty = true;
+        } else if (eql(o, "-i") or eql(o, "--interactive")) {
+            // stdin is always passed through.
         } else if (eql(o, "-e")) {
             i += 1;
             if (i >= args.len) die("-e needs a value", .{});
