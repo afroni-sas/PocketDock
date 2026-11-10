@@ -11,6 +11,7 @@ const sys = @import("sys.zig");
 const tracer = @import("tracer.zig");
 const vfs_mod = @import("vfs.zig");
 const control = @import("control.zig");
+const tty = @import("tty.zig");
 const quota = @import("quota.zig");
 const Store = @import("store.zig").Store;
 const Allocator = std.mem.Allocator;
@@ -50,6 +51,7 @@ pub const Config = struct {
     ip: []const u8 = "",
     /// "bridge", "private" or "none".
     network: []const u8 = "bridge",
+    host_gateway: bool = false,
     memory: u64 = 0,
     cpus_milli: u32 = 0,
     cpuset: u64 = 0,
@@ -67,6 +69,9 @@ pub const State = struct {
     status: []const u8 = "created",
     pid: i32 = 0,
     shim_pid: i32 = 0,
+    /// When the supervisor started, which tells it from a later process that
+    /// happens to get the same pid.
+    shim_start: u64 = 0,
     exit_code: i32 = 0,
     started_at: i64 = 0,
     finished_at: i64 = 0,
@@ -93,6 +98,7 @@ pub const CreateOptions = struct {
     max_retries: u32 = 0,
     auto_remove: bool = false,
     network: []const u8 = "bridge",
+    host_gateway: bool = false,
     memory: u64 = 0,
     cpus_milli: u32 = 0,
     cpuset: u64 = 0,
@@ -116,7 +122,7 @@ pub const UserInfo = struct { uid: u32, gid: u32, home: []const u8 };
 
 pub const Stats = struct { pids: u64, memory: u64, cpu_ms: u64 };
 
-pub const Attach = enum { detached, foreground, tty };
+pub const Attach = enum { detached, foreground, interactive, tty };
 
 const hosts_header = "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n";
 
@@ -255,16 +261,30 @@ pub const Manager = struct {
     }
 
     pub fn loadState(self: *Manager, id: []const u8) !State {
-        const data = try sys.readFileAlloc(self.a, self.file(id, "state.json"), 1 << 20);
-        var st = try std.json.parseFromSliceLeaky(State, self.a, data, .{ .ignore_unknown_fields = true });
+        var st = try self.readState(id);
         // The supervisor died without saying so, e.g. the phone rebooted.
-        const live = std.mem.eql(u8, st.status, "running") or std.mem.eql(u8, st.status, "restarting");
-        if (live and !sys.pidAlive(st.shim_pid)) {
+        if (claimsLive(&st) and !supervisorAlive(&st)) {
             st.status = "exited";
             st.exit_code = 137;
             st.pid = 0;
         }
         return st;
+    }
+
+    fn readState(self: *Manager, id: []const u8) !State {
+        const data = try sys.readFileAlloc(self.a, self.file(id, "state.json"), 1 << 20);
+        return std.json.parseFromSliceLeaky(State, self.a, data, .{ .ignore_unknown_fields = true });
+    }
+
+    /// A container that should be running but whose supervisor was killed.
+    /// One that exited on its own has already had its restart policy applied.
+    pub fn orphaned(self: *Manager, id: []const u8) bool {
+        const cfg = self.loadConfig(id) catch return false;
+        if (cfg.builder or !shouldRestart(&cfg, 137, 0)) return false;
+        const st = self.readState(id) catch return false;
+        if (!claimsLive(&st) or supervisorAlive(&st)) return false;
+        var marker = Path.of(self.file(id, "stop-requested")) catch return false;
+        return !sys.exists(marker.z());
     }
 
     fn saveState(self: *Manager, id: []const u8, st: State) void {
@@ -439,6 +459,7 @@ pub const Manager = struct {
             .ports = opts.ports,
             .volumes = volumes.items,
             .restart = opts.restart,
+            .host_gateway = opts.host_gateway,
             .max_retries = opts.max_retries,
             .auto_remove = opts.auto_remove,
             .created_at = @intCast(@divFloor(sys.nowNs(), std.time.ns_per_s)),
@@ -664,7 +685,7 @@ pub const Manager = struct {
 
     fn supervise(self: *Manager, cfg: *const Config, attach: Attach, ready_fd: i32) !u8 {
         const id = cfg.id;
-        var state: State = .{ .shim_pid = linux.getpid(), .status = "running" };
+        var state: State = .{ .shim_pid = linux.getpid(), .shim_start = sys.procStart(linux.getpid()), .status = "running" };
 
         // The tracer grows this list with the same allocator.
         var ports: std.ArrayList(tracer.PortMap) = .empty;
@@ -676,7 +697,10 @@ pub const Manager = struct {
         const vfs = try self.makeVfs(cfg);
         const exec_path = try self.findExecutable(vfs, cfg, cfg.argv[0]);
         const argv = try self.zList(cfg.argv);
-        const envp = try self.zList(cfg.env);
+        var env_list: std.ArrayList([]const u8) = .empty;
+        try env_list.appendSlice(self.a, cfg.env);
+        if (attach == .tty) try addDefaultTerm(self.a, &env_list);
+        const envp = try self.zList(env_list.items);
 
         var stdout_fd: i32 = 1;
         var stderr_fd: i32 = 2;
@@ -691,25 +715,14 @@ pub const Manager = struct {
             if (logger_pid == 0) {
                 sys.close(pipes[0][1]);
                 sys.close(pipes[1][1]);
-                runLogger(pipes[0][0], pipes[1][0], self.file(id, "ctr.log"), attach == .foreground);
+                runLogger(pipes[0][0], pipes[1][0], self.file(id, "ctr.log"), attach != .detached);
             }
             sys.close(pipes[0][0]);
             sys.close(pipes[1][0]);
         }
 
-        for ([_]linux.SIG{ .TERM, .HUP, .INT, .QUIT }) |s| {
-            if (attach == .tty and (s == .INT or s == .QUIT)) {
-                // The terminal already delivers these to the guest.
-                var act: linux.Sigaction = .{
-                    .handler = .{ .handler = linux.SIG.IGN },
-                    .mask = std.mem.zeroes(linux.sigset_t),
-                    .flags = 0,
-                };
-                _ = linux.sigaction(s, &act, null);
-            } else {
-                installForwarder(s);
-            }
-        }
+        // A handler rather than SIG_IGN, which the guest would inherit.
+        for ([_]linux.SIG{ .TERM, .HUP, .INT, .QUIT }) |s| installForwarder(s);
 
         if (cfg.ports.len > 0) {
             const list = try self.a.alloc(PortEntry, cfg.ports.len);
@@ -719,7 +732,24 @@ pub const Manager = struct {
 
         var ctx: RunCtx = .{ .mgr = self, .id = id, .state = &state, .ready_fd = ready_fd };
         var stdin_fd: i32 = 0;
-        if (attach != .tty) stdin_fd = try sys.open("/dev/null", 0, 0);
+        if (attach == .detached or attach == .foreground) stdin_fd = try sys.open("/dev/null", 0, 0);
+
+        var pty: ?sys.Pty = null;
+        var relay_pid: i32 = 0;
+        if (attach == .tty) {
+            const p = try sys.openPty();
+            pty = p;
+            tty.copySize(p.master);
+            relay_pid = try sys.fork();
+            if (relay_pid == 0) {
+                sys.close(p.slave);
+                runTtyRelay(p.master, self.file(id, "ctr.log"));
+            }
+            sys.close(p.master);
+            stdin_fd = p.slave;
+            stdout_fd = p.slave;
+            stderr_fd = p.slave;
+        }
 
         var health: ?tracer.HealthSpec = null;
         if (cfg.health) |h| {
@@ -761,7 +791,9 @@ pub const Manager = struct {
             .stdin_fd = stdin_fd,
             .stdout_fd = stdout_fd,
             .stderr_fd = stderr_fd,
-            .new_session = attach != .tty,
+            .ctty = attach == .tty,
+            .shm_dir = self.file(id, "shm"),
+            .host_gateway = cfg.host_gateway,
             .debug = self.debug,
             .ctx = &ctx,
             .on_start = onStart,
@@ -807,11 +839,17 @@ pub const Manager = struct {
             var status: i32 = 0;
             _ = linux.waitpid(logger_pid, &status, 0);
         }
+        if (pty) |p| {
+            // The relay sees the terminal close and puts the user's back.
+            sys.close(p.slave);
+            var status: i32 = 0;
+            _ = linux.waitpid(relay_pid, &status, 0);
+        }
         if (cfg.auto_remove) self.removeFiles(id);
         return code;
     }
 
-    fn shouldRestart(cfg: *const Config, code: u8, restarts: u32) bool {
+    pub fn shouldRestart(cfg: *const Config, code: u8, restarts: u32) bool {
         if (std.mem.eql(u8, cfg.restart, "always") or std.mem.eql(u8, cfg.restart, "unless-stopped")) return true;
         if (std.mem.eql(u8, cfg.restart, "on-failure")) {
             if (code == 0) return false;
@@ -839,6 +877,7 @@ pub const Manager = struct {
             .gid = step.gid,
             .ports = &ports,
             .sock_dir = self.store.path(&.{"sk"}),
+            .shm_dir = self.file(cfg.id, "shm"),
             .stdin_fd = try sys.open("/dev/null", 0, 0),
             .ns_id = cfg.id,
             .debug = self.debug,
@@ -963,8 +1002,7 @@ pub const Manager = struct {
     }
 
     /// Runs one more process inside a running container.
-    pub fn exec(self: *Manager, id: []const u8, command: []const []const u8, extra_env: []const []const u8, tty: bool) !u8 {
-        _ = tty;
+    pub fn exec(self: *Manager, id: []const u8, command: []const []const u8, extra_env: []const []const u8, use_tty: bool) !u8 {
         const cfg = try self.loadConfig(id);
         const st = try self.loadState(id);
         if (!std.mem.eql(u8, st.status, "running")) {
@@ -973,6 +1011,7 @@ pub const Manager = struct {
         }
         var env: std.ArrayList([]const u8) = .empty;
         for (cfg.env) |e| try setEnv(self.a, &env, e);
+        if (use_tty) try addDefaultTerm(self.a, &env);
         for (extra_env) |e| try setEnv(self.a, &env, e);
 
         const vfs = try self.makeVfs(&cfg);
@@ -981,7 +1020,7 @@ pub const Manager = struct {
         const exec_path = try self.findExecutable(vfs, &patched, command[0]);
 
         var msg: std.ArrayList(u8) = .empty;
-        try msg.append(self.a, control.op_exec);
+        try msg.append(self.a, if (use_tty) control.op_exec_tty else control.op_exec);
         const field = struct {
             fn f(a: Allocator, m: *std.ArrayList(u8), s: []const u8) !void {
                 try m.appendSlice(a, s);
@@ -997,12 +1036,24 @@ pub const Manager = struct {
 
         const fd = try self.connectCtl(id, st.shim_pid);
         defer sys.close(fd);
-        const stdio = [3]i32{ 0, 1, 2 };
+        var pty: ?sys.Pty = null;
+        var stdio = [3]i32{ 0, 1, 2 };
+        if (use_tty) {
+            const p = try sys.openPty();
+            pty = p;
+            tty.copySize(p.master);
+            stdio = @splat(p.slave);
+        }
         var pid_buf: [4]u8 align(4) = undefined;
         const n = try self.request(fd, st.shim_pid, msg.items, &stdio, &pid_buf);
         if (n != 4) return error.ExecFailed;
         fwd_pid = std.mem.readInt(i32, &pid_buf, .little);
         for ([_]linux.SIG{ .TERM, .HUP, .INT, .QUIT }) |s| installForwarder(s);
+
+        if (pty) |p| {
+            sys.close(p.slave);
+            tty.relay(p.master, .{ .done_fd = fd });
+        }
 
         var none: [0]i32 = undefined;
         var code: [1]u8 = undefined;
@@ -1155,6 +1206,22 @@ pub fn setEnv(a: Allocator, env: *std.ArrayList([]const u8), entry: []const u8) 
     try env.append(a, entry);
 }
 
+fn claimsLive(st: *const State) bool {
+    return std.mem.eql(u8, st.status, "running") or std.mem.eql(u8, st.status, "restarting");
+}
+
+fn supervisorAlive(st: *const State) bool {
+    return sys.sameProcess(st.shim_pid, st.shim_start);
+}
+
+/// Programs need TERM to drive a terminal; Docker sets the same default.
+fn addDefaultTerm(a: Allocator, env: *std.ArrayList([]const u8)) !void {
+    for (env.items) |e| {
+        if (std.mem.startsWith(u8, e, "TERM=")) return;
+    }
+    try env.append(a, "TERM=xterm");
+}
+
 fn portAvailable(port: u16) bool {
     const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (linux.errno(rc) != .SUCCESS) return false;
@@ -1225,6 +1292,48 @@ fn drain(log: *Log, buf: *LineBuf, stream: []const u8, fd: i32, tee_fd: i32) boo
     std.mem.copyForwards(u8, buf.data[0 .. buf.len - start], buf.data[start..buf.len]);
     buf.len -= start;
     return true;
+}
+
+const TtyLog = struct {
+    log: Log,
+    buf: LineBuf,
+
+    fn write(ctx: ?*anyopaque, data: []const u8) void {
+        const self: *TtyLog = @ptrCast(@alignCast(ctx.?));
+        var rest = data;
+        while (rest.len > 0) {
+            if (self.buf.len == self.buf.data.len) {
+                self.log.line("stdout", 'P', &self.buf.data);
+                self.buf.len = 0;
+            }
+            const n = @min(rest.len, self.buf.data.len - self.buf.len);
+            @memcpy(self.buf.data[self.buf.len..][0..n], rest[0..n]);
+            self.buf.len += n;
+            rest = rest[n..];
+            var start: usize = 0;
+            while (std.mem.indexOfScalarPos(u8, self.buf.data[0..self.buf.len], start, '\n')) |nl| {
+                self.log.line("stdout", 'F', std.mem.trimEnd(u8, self.buf.data[start..nl], "\r"));
+                start = nl + 1;
+            }
+            std.mem.copyForwards(u8, self.buf.data[0 .. self.buf.len - start], self.buf.data[start..self.buf.len]);
+            self.buf.len -= start;
+        }
+    }
+};
+
+/// Connects the user's terminal to a container and logs what it prints.
+fn runTtyRelay(master: i32, path: []const u8) noreturn {
+    const ignore: linux.Sigaction = .{
+        .handler = .{ .handler = linux.SIG.IGN },
+        .mask = std.mem.zeroes(linux.sigset_t),
+        .flags = 0,
+    };
+    _ = linux.sigaction(.PIPE, &ignore, null);
+    var sink: TtyLog = .{ .log = Log.open(path), .buf = undefined };
+    sink.buf.len = 0;
+    tty.relay(master, .{ .ctx = &sink, .on_output = TtyLog.write });
+    if (sink.buf.len > 0) sink.log.line("stdout", 'P', sink.buf.data[0..sink.buf.len]);
+    linux.exit_group(0);
 }
 
 fn runLogger(out_fd: i32, err_fd: i32, path: []const u8, tee: bool) noreturn {

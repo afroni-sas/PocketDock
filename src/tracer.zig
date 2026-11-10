@@ -16,6 +16,7 @@ const scs = @import("syscalls.zig");
 const vfs_mod = @import("vfs.zig");
 const control = @import("control.zig");
 const quota = @import("quota.zig");
+const sysv = @import("sysv.zig");
 
 const Vfs = vfs_mod.Vfs;
 const Resolved = vfs_mod.Resolved;
@@ -82,6 +83,12 @@ pub const Spec = struct {
     stderr_fd: i32 = 2,
     stdin_fd: i32 = 0,
     new_session: bool = true,
+    /// Makes stdin the controlling terminal of the first process.
+    ctty: bool = false,
+    /// Lets this container reach the phone's own loopback at 10.88.0.1.
+    host_gateway: bool = false,
+    /// Holds the files behind System V shared memory segments.
+    shm_dir: []const u8 = "",
     /// Logs every intercepted syscall to stderr.
     debug: bool = false,
     ctx: ?*anyopaque = null,
@@ -147,6 +154,30 @@ const ExitAction = enum {
     fix_dents,
     fix_sysinfo,
     fix_affinity,
+    fix_tty_pgrp,
+    fix_tty_sid,
+};
+
+/// Syscalls the tracer runs in the guest on its behalf, one after the other.
+/// Used when a single guest call needs several real ones.
+const Chain = struct {
+    active: bool = false,
+    /// The next syscall stop is an injected call's entry, not its exit.
+    at_entry: bool = false,
+    op: enum { shmat, shmdt } = .shmat,
+    step: u8 = 0,
+    /// The registers to hand back when the chain is over.
+    saved: arch.Regs = undefined,
+    seg: i32 = 0,
+    addr: u64 = 0,
+    size: u64 = 0,
+    prot: u64 = 0,
+    map_flags: u64 = 0,
+    fd: i64 = -1,
+    result: i64 = 0,
+    /// Signals that arrived meanwhile, delivered once the chain is over: a
+    /// handler must not run between two injected calls.
+    deferred: u64 = 0,
 };
 
 const Tracee = struct {
@@ -167,6 +198,7 @@ const Tracee = struct {
     /// CPU quota: keep this task stopped.
     hold: bool = false,
     held: bool = false,
+    chain: Chain = .{},
 };
 
 const WakeSignals = struct {
@@ -187,6 +219,16 @@ const BPF_RET_K: u16 = 0x06;
 const RET_ALLOW: u32 = 0x7fff0000;
 const RET_TRACE: u32 = 0x7ff00000;
 const RET_ENOSYS: u32 = 0x00050000 | 38;
+
+const PR_SET_KEEPCAPS: u32 = 8;
+const PR_CAPBSET_DROP: u32 = 24;
+const PR_SET_SECUREBITS: u32 = 28;
+const PR_CAP_AMBIENT: u32 = 47;
+
+const TIOCSCTTY: u32 = 0x540E;
+const TIOCGPGRP: u32 = 0x540F;
+const TIOCSPGRP: u32 = 0x5410;
+const TIOCGSID: u32 = 0x5429;
 
 fn dataArgLow(i: u32) u32 {
     return 16 + 8 * i;
@@ -220,6 +262,29 @@ fn buildFilter(out: []SockFilter, strict_net: bool) usize {
                 emit(out, &n, BPF_JEQ_K, 0, 3, 0);
                 emit(out, &n, BPF_LD_W_ABS, 0, 0, dataArgLow(4) + 4);
                 emit(out, &n, BPF_JEQ_K, 0, 1, 0);
+                emit(out, &n, BPF_RET_K, 0, 0, RET_ALLOW);
+                emit(out, &n, BPF_RET_K, 0, 0, RET_TRACE);
+            },
+            .ioctl_pgrp => {
+                // Almost every ioctl is left alone: only the terminal calls
+                // that carry a process id need translating.
+                emit(out, &n, BPF_JEQ_K, 0, 6, @intCast(nr));
+                emit(out, &n, BPF_LD_W_ABS, 0, 0, dataArgLow(1));
+                emit(out, &n, BPF_JEQ_K, 3, 0, TIOCGPGRP);
+                emit(out, &n, BPF_JEQ_K, 2, 0, TIOCSPGRP);
+                emit(out, &n, BPF_JEQ_K, 1, 0, TIOCGSID);
+                emit(out, &n, BPF_RET_K, 0, 0, RET_ALLOW);
+                emit(out, &n, BPF_RET_K, 0, 0, RET_TRACE);
+            },
+            .prctl_caps => {
+                // The guest's root is virtual, so the kernel would refuse
+                // these: Android apps run with their capability bits locked.
+                emit(out, &n, BPF_JEQ_K, 0, 7, @intCast(nr));
+                emit(out, &n, BPF_LD_W_ABS, 0, 0, dataArgLow(0));
+                emit(out, &n, BPF_JEQ_K, 4, 0, PR_SET_KEEPCAPS);
+                emit(out, &n, BPF_JEQ_K, 3, 0, PR_CAPBSET_DROP);
+                emit(out, &n, BPF_JEQ_K, 2, 0, PR_SET_SECUREBITS);
+                emit(out, &n, BPF_JEQ_K, 1, 0, PR_CAP_AMBIENT);
                 emit(out, &n, BPF_RET_K, 0, 0, RET_ALLOW);
                 emit(out, &n, BPF_RET_K, 0, 0, RET_TRACE);
             },
@@ -300,6 +365,15 @@ fn readStr(pid: i32, addr: u64, out: *Path) Err!void {
     return sys.fail(.NAMETOOLONG);
 }
 
+/// Makes a guest stopped in a chain run one more syscall.
+fn injectCall(t: *Tracee, nr: linux.SYS, args: [6]u64) void {
+    var r = t.chain.saved;
+    arch.rewindSyscall(&r, @backingInt(nr));
+    for (args, 0..) |v, i| arch.setArg(&r, i, v);
+    arch.setRegs(t.tid, &r) catch {};
+    t.chain.at_entry = true;
+}
+
 const Ctx = struct {
     tr: *Tracer,
     t: *Tracee,
@@ -345,6 +419,25 @@ const Ctx = struct {
 
     fn finishErr(c: *Ctx, e: sys.E) void {
         c.finish(-@as(i64, @backingInt(e)));
+    }
+
+    /// Starts a chain with `first` in place of the current syscall.
+    fn beginChain(c: *Ctx, nr: linux.SYS, args: [6]u64) Err!void {
+        const ch = &c.t.chain;
+        ch.active = true;
+        ch.step = 0;
+        ch.deferred = 0;
+        ch.saved = c.regs;
+        if (c.trapped) {
+            // The kernel is done with this call, so step back and make the
+            // guest execute the syscall instruction again.
+            injectCall(c.t, nr, args);
+            return;
+        }
+        ch.at_entry = false;
+        try arch.setSysno(c.t.tid, &c.regs, @intCast(@backingInt(nr)));
+        for (args, 0..) |v, i| arch.setArg(&c.regs, i, v);
+        c.dirty = true;
     }
 
     fn flush(c: *Ctx) void {
@@ -459,6 +552,9 @@ pub const Tracer = struct {
     health_failures: u32 = 0,
     started_at: i128 = 0,
     health_status: []const u8 = "",
+    shm: sysv.Table,
+    /// Unix sockets cannot be files here, so they live in the abstract namespace.
+    unix_abstract: bool = false,
 
     fn procToReal(ctx: *anyopaque, v: i32) ?i32 {
         const self: *Tracer = @ptrCast(@alignCast(ctx));
@@ -553,6 +649,7 @@ pub const Tracer = struct {
     }
 
     fn forgetProc(self: *Tracer, p: *Proc) void {
+        self.shm.gone(p.tgid);
         _ = self.by_vpid.remove(p.vpid);
         // Its parent may still collect it with wait().
         if (p.vppid != 0 and self.by_vpid.contains(p.vppid)) {
@@ -588,7 +685,7 @@ pub const Tracer = struct {
     }
 
     fn resumeT(_: *Tracer, t: *Tracee, sig: usize) void {
-        const req: u32 = if (t.exit != .none) PT.SYSCALL else PT.CONT;
+        const req: u32 = if (t.exit != .none or t.chain.active) PT.SYSCALL else PT.CONT;
         _ = linux.ptrace(req, t.tid, 0, sig, 0);
     }
 
@@ -610,19 +707,22 @@ pub const Tracer = struct {
         var name: [32]u8 = undefined;
         var path = Path.of(self.spec.port_dir) catch return false;
         path.append(std.fmt.bufPrint(&name, "/{d}", .{port}) catch unreachable) catch return false;
-        var num: [16]u8 = undefined;
-        const me = std.fmt.bufPrintSentinel(&num, "{d}", .{linux.getpid()}, 0) catch unreachable;
+        // With its start time: after a reboot, another process may have this pid.
+        var num: [48]u8 = undefined;
+        const me = std.fmt.bufPrintSentinel(&num, "{d}.{d}", .{ linux.getpid(), sys.procStart(linux.getpid()) }, 0) catch unreachable;
         for (0..2) |_| {
             // A symlink appears atomically with its target, so unlike a file
             // that gets written after being created, there is no moment when
             // a live lock looks empty and could be mistaken for a stale one.
             sys.symlink(me.ptr, path.z()) catch {
                 if (sys.last != .EXIST) return false;
-                var buf: [16]u8 = undefined;
+                var buf: [48]u8 = undefined;
                 const target = sys.readlink(path.z(), &buf) catch continue;
-                const owner = std.fmt.parseInt(i32, target, 10) catch 0;
+                var parts = std.mem.splitScalar(u8, target, '.');
+                const owner = std.fmt.parseInt(i32, parts.first(), 10) catch 0;
+                const started = std.fmt.parseInt(u64, parts.next() orelse "0", 10) catch 0;
                 if (owner == linux.getpid()) return true;
-                if (owner != 0 and sys.pidAlive(owner)) return false;
+                if (owner != 0 and sys.sameProcess(owner, started)) return false;
                 sys.unlink(path.z()) catch return false;
                 continue;
             };
@@ -797,7 +897,11 @@ pub const Tracer = struct {
             .vfs = spec.vfs,
             .real_uid = linux.getuid(),
             .real_gid = linux.getgid(),
+            .shm = .{ .gpa = gpa, .dir = spec.shm_dir },
         };
+        self.shm.clearDir();
+        defer self.shm.deinit();
+        self.unix_abstract = !socketFilesWork(spec.sock_dir);
         spec.vfs.procs = .{ .ctx = &self, .lookup = procLookup, .toReal = procToReal };
         var net_dir_path: ?Path = null;
         if (spec.net_dir.len > 0) {
@@ -861,6 +965,7 @@ pub const Tracer = struct {
                 .stdout_fd = spec.stdout_fd,
                 .stderr_fd = spec.stderr_fd,
                 .new_session = spec.new_session,
+                .ctty = spec.ctty,
             });
         }
 
@@ -945,11 +1050,15 @@ pub const Tracer = struct {
 
             const SIGSTOP: u32 = @backingInt(linux.SIG.STOP);
             if (event == PT.EVENT.SECCOMP) {
-                self.onEnter(t);
+                if (!t.chain.active) self.onEnter(t);
                 self.resumeT(t, 0);
             } else if (sig == @as(u32, @backingInt(linux.SIG.TRAP)) | 0x80) {
-                self.onExit(t);
-                t.exit = .none;
+                if (t.chain.active) {
+                    self.chainStop(t);
+                } else {
+                    self.onExit(t);
+                    t.exit = .none;
+                }
                 self.resumeT(t, 0);
             } else if (event == PT.EVENT.FORK or event == PT.EVENT.VFORK or event == PT.EVENT.CLONE) {
                 try self.onFork(t, event);
@@ -977,6 +1086,9 @@ pub const Tracer = struct {
                 } else {
                     self.resumeT(t, 0);
                 }
+            } else if (t.chain.active) {
+                t.chain.deferred |= @as(u64, 1) << @intCast(sig - 1);
+                self.resumeT(t, 0);
             } else if (sig == @as(u32, @backingInt(linux.SIG.SYS)) and self.onSigsys(t)) {
                 self.resumeT(t, 0);
             } else {
@@ -1019,6 +1131,7 @@ pub const Tracer = struct {
         stdout_fd: i32,
         stderr_fd: i32,
         new_session: bool,
+        ctty: bool = false,
     };
 
     /// Becomes a traced guest process. Runs between fork and exec, so it
@@ -1030,6 +1143,10 @@ pub const Tracer = struct {
         _ = linux.dup2(args.stdin_fd, 0);
         _ = linux.dup2(args.stdout_fd, 1);
         _ = linux.dup2(args.stderr_fd, 2);
+        for ([_]i32{ args.stdin_fd, args.stdout_fd, args.stderr_fd }) |fd| {
+            if (fd > 2) sys.close(fd);
+        }
+        if (args.ctty) _ = linux.ioctl(0, TIOCSCTTY, 0);
         if (self.spec.limits.cpuset != 0) {
             var mask: [16]u64 = @splat(0);
             mask[0] = self.spec.limits.cpuset;
@@ -1067,9 +1184,9 @@ pub const Tracer = struct {
                 const s = try std.fmt.bufPrint(&out, "{d} {d} {d}", .{ self.tracees.count(), self.memoryUsed(true), self.cpu_total * 10 });
                 try control.send(conn, s, &.{});
             },
-            control.op_exec => {
+            control.op_exec, control.op_exec_tty => {
                 if (got.nfds != 3) return error.BadRequest;
-                try self.spawnExec(conn, buf[1..got.len], &fds);
+                try self.spawnExec(conn, buf[1..got.len], &fds, buf[0] == control.op_exec_tty);
             },
             else => return error.BadRequest,
         }
@@ -1077,7 +1194,7 @@ pub const Tracer = struct {
 
     /// Starts an `exec` process. Doing it here keeps it in the container's
     /// process table and lets it die with the container, as Docker does.
-    fn spawnExec(self: *Tracer, conn: i32, msg: []u8, fds: *[3]i32) !void {
+    fn spawnExec(self: *Tracer, conn: i32, msg: []u8, fds: *[3]i32, ctty: bool) !void {
         defer for (fds) |fd| sys.close(fd);
         const nextStr = struct {
             fn f(m: []u8, pos: *usize) ![*:0]const u8 {
@@ -1112,6 +1229,7 @@ pub const Tracer = struct {
                 .stdout_fd = fds[1],
                 .stderr_fd = fds[2],
                 .new_session = true,
+                .ctty = ctty,
             });
         }
         const t = try self.getOrAdd(pid);
@@ -1322,6 +1440,7 @@ pub const Tracer = struct {
             child_t.proc = pp;
         } else {
             child_t.proc = try self.newProc(new_tid, pp);
+            self.shm.forked(pp.tgid, new_tid);
         }
         if (child_t.parked) {
             child_t.parked = false;
@@ -1337,6 +1456,7 @@ pub const Tracer = struct {
         const old_tid: i32 = @intCast(old);
         if (old_tid != t.tid) self.drop(old_tid);
         if (t.proc) |p| {
+            self.shm.gone(p.tgid);
             if (p.pending_exe.len > 0) {
                 p.exe = p.pending_exe;
                 p.pending_exe.len = 0;
@@ -1387,7 +1507,7 @@ pub const Tracer = struct {
         c.trapped = true;
         const sc = scs.lookup(@intCast(nr));
         switch (sc.h) {
-            .getid, .getresid, .setid, .getgroups, .setgroups, .capget, .succeed, .eperm, .enosys => {
+            .getid, .getresid, .setid, .getgroups, .setgroups, .capget, .succeed, .eperm, .enosys, .shmget, .shmat, .shmdt, .shmctl => {
                 dispatch(&c, sc) catch c.finishErr(sys.last);
             },
             .chroot => c.finish(0),
@@ -1451,6 +1571,78 @@ pub const Tracer = struct {
             .fix_dents => if (ret > 0) self.patchDents(t, &regs, ret),
             .fix_sysinfo => if (ret == 0) self.patchSysinfo(t),
             .fix_affinity => if (ret > 0) self.patchAffinity(t, ret),
+            .fix_tty_pgrp => if (ret == 0) self.patchTtyId(t, true),
+            .fix_tty_sid => if (ret == 0) self.patchTtyId(t, false),
+        }
+    }
+
+    /// The kernel answers terminal queries with real ids.
+    fn patchTtyId(self: *Tracer, t: *Tracee, is_group: bool) void {
+        var b: [4]u8 = undefined;
+        readMem(t.tid, t.a0, &b) catch return;
+        const real = std.mem.readInt(i32, &b, .little);
+        var v: ?i32 = null;
+        if (is_group) {
+            var it = self.by_vpid.valueIterator();
+            while (it.next()) |p| {
+                if (p.*.real_pgid == real) v = p.*.vpgid;
+            }
+        } else {
+            v = self.realToV(real, false);
+        }
+        std.mem.writeInt(i32, &b, v orelse return, .little);
+        writeMem(t.tid, t.a0, &b) catch {};
+    }
+
+    /// A syscall stop of a guest in the middle of a chain.
+    fn chainStop(self: *Tracer, t: *Tracee) void {
+        const ch = &t.chain;
+        if (ch.at_entry) {
+            ch.at_entry = false;
+            return;
+        }
+        var regs: arch.Regs = undefined;
+        arch.getRegs(t.tid, &regs) catch return;
+        const ret = arch.ret(&regs);
+        const p = t.proc.?;
+        switch (ch.op) {
+            .shmat => switch (ch.step) {
+                0 => {
+                    if (ret < 0) return self.endChain(t, ret);
+                    ch.fd = ret;
+                    ch.step = 1;
+                    injectCall(t, .mmap, .{ ch.addr, ch.size, ch.prot, ch.map_flags, @bitCast(ret), 0 });
+                },
+                1 => {
+                    // A mapping refused for overlapping is EINVAL to shmat().
+                    const EEXIST: i64 = -@as(i64, @backingInt(linux.E.EXIST));
+                    const EINVAL: i64 = -@as(i64, @backingInt(linux.E.INVAL));
+                    ch.result = if (ret == EEXIST) EINVAL else ret;
+                    ch.step = 2;
+                    injectCall(t, .close, .{ @bitCast(ch.fd), 0, 0, 0, 0, 0 });
+                },
+                else => {
+                    if (ch.result >= 0) self.shm.noteAttach(ch.seg, p.tgid, @bitCast(ch.result), p.vpid);
+                    self.endChain(t, ch.result);
+                },
+            },
+            .shmdt => {
+                if (ret == 0) self.shm.noteDetach(p.tgid, ch.addr, p.vpid);
+                self.endChain(t, ret);
+            },
+        }
+    }
+
+    fn endChain(_: *Tracer, t: *Tracee, result: i64) void {
+        const ch = &t.chain;
+        var r = ch.saved;
+        arch.setRet(&r, result);
+        arch.setRegs(t.tid, &r) catch {};
+        ch.active = false;
+        var mask = ch.deferred;
+        while (mask != 0) : (mask &= mask - 1) {
+            const n: u32 = @ctz(mask) + 1;
+            _ = linux.tgkill(t.proc.?.tgid, t.tid, @fromBackingInt(n));
         }
     }
 
@@ -2022,6 +2214,140 @@ fn dispatch(c: *Ctx, sc: Sc) Err!void {
         .succeed => c.finish(0),
         .eperm => return sys.fail(.PERM),
         .enosys => return sys.fail(.NOSYS),
+        .shmget => try doShmget(c),
+        .shmat => try doShmat(c),
+        .shmdt => try doShmdt(c),
+        .shmctl => try doShmctl(c),
+        .ioctl_pgrp => try doTtyIoctl(c),
+        .prctl_caps => c.finish(0),
+    }
+}
+
+fn shmWho(c: *const Ctx) sysv.Who {
+    return .{ .uid = c.p.ids.euid, .gid = c.p.ids.egid, .pid = c.p.vpid };
+}
+
+fn doShmget(c: *Ctx) Err!void {
+    c.finish(try c.tr.shm.get(c.argI32(0), c.arg(1), @truncate(c.arg(2)), shmWho(c)));
+}
+
+fn doShmat(c: *Ctx) Err!void {
+    const seg = c.tr.shm.find(c.argI32(0)) orelse return sys.fail(.INVAL);
+    const flags: u32 = @truncate(c.arg(2));
+    const read_only = flags & sysv.SHM_RDONLY != 0;
+    if (!seg.allowed(shmWho(c), if (read_only) 4 else 6)) return sys.fail(.ACCES);
+
+    const page: u64 = std.heap.pageSize();
+    var addr = c.arg(1);
+    if (addr != 0) {
+        if (flags & sysv.SHM_RND != 0) addr &= ~(page - 1);
+        if (addr & (page - 1) != 0) return sys.fail(.INVAL);
+    } else if (flags & sysv.SHM_REMAP != 0) {
+        return sys.fail(.INVAL);
+    }
+
+    const MAP_SHARED: u64 = 1;
+    const MAP_FIXED: u64 = 0x10;
+    const MAP_FIXED_NOREPLACE: u64 = 0x100000;
+    var map_flags = MAP_SHARED;
+    if (addr != 0) map_flags |= if (flags & sysv.SHM_REMAP != 0) MAP_FIXED else MAP_FIXED_NOREPLACE;
+    var prot: u64 = 1;
+    if (!read_only) prot |= 2;
+    if (flags & sysv.SHM_EXEC != 0) prot |= 4;
+
+    var file: Path = .{};
+    try c.tr.shm.pathOf(seg.id, &file);
+    const path = try c.pushZ(file.slice());
+    const ch = &c.t.chain;
+    ch.op = .shmat;
+    ch.seg = seg.id;
+    ch.addr = addr;
+    ch.size = seg.size;
+    ch.prot = prot;
+    ch.map_flags = map_flags;
+    const mode: u64 = if (read_only) 0 else sys.O_RDWR;
+    try c.beginChain(.openat, .{ @bitCast(@as(i64, sys.AT_FDCWD)), path, mode | sys.O_CLOEXEC, 0, 0, 0 });
+}
+
+fn doShmdt(c: *Ctx) Err!void {
+    const addr = c.arg(0);
+    const a = c.tr.shm.attachmentAt(c.p.tgid, addr) orelse return sys.fail(.INVAL);
+    c.t.chain.op = .shmdt;
+    c.t.chain.addr = addr;
+    try c.beginChain(.munmap, .{ addr, a.size, 0, 0, 0, 0 });
+}
+
+fn doShmctl(c: *Ctx) Err!void {
+    const shm = &c.tr.shm;
+    const who = shmWho(c);
+    const IPC_64: u32 = 0x100;
+    const cmd = @as(u32, @truncate(c.arg(1))) & ~IPC_64;
+    const buf = c.arg(2);
+    switch (cmd) {
+        sysv.IPC_INFO => {
+            const b = shm.info();
+            try writeMem(c.t.tid, buf, &b);
+            c.finish(@max(0, shm.highestIndex()));
+        },
+        sysv.SHM_INFO => {
+            const b = shm.usage();
+            try writeMem(c.t.tid, buf, &b);
+            c.finish(@max(0, shm.highestIndex()));
+        },
+        sysv.SHM_STAT, sysv.SHM_STAT_ANY => {
+            const index: usize = @truncate(c.arg(0) & 0xffffffff);
+            if (index >= shm.segs.items.len) return sys.fail(.INVAL);
+            const s = &shm.segs.items[index];
+            if (cmd == sysv.SHM_STAT and !s.allowed(who, 4)) return sys.fail(.ACCES);
+            const b = s.stat();
+            try writeMem(c.t.tid, buf, &b);
+            c.finish(s.id);
+        },
+        sysv.IPC_STAT => {
+            const s = shm.find(c.argI32(0)) orelse return sys.fail(.INVAL);
+            if (!s.allowed(who, 4)) return sys.fail(.ACCES);
+            const b = s.stat();
+            try writeMem(c.t.tid, buf, &b);
+            c.finish(0);
+        },
+        sysv.IPC_SET => {
+            const s = shm.find(c.argI32(0)) orelse return sys.fail(.INVAL);
+            if (!s.isOwner(who)) return sys.fail(.PERM);
+            var b: [sysv.stat_size]u8 = undefined;
+            try readMem(c.t.tid, buf, &b);
+            s.applySet(&b);
+            c.finish(0);
+        },
+        sysv.IPC_RMID => {
+            const s = shm.find(c.argI32(0)) orelse return sys.fail(.INVAL);
+            if (!s.isOwner(who)) return sys.fail(.PERM);
+            shm.remove(s);
+            c.finish(0);
+        },
+        sysv.SHM_LOCK, sysv.SHM_UNLOCK => {
+            if (shm.find(c.argI32(0)) == null) return sys.fail(.INVAL);
+            c.finish(0);
+        },
+        else => return sys.fail(.INVAL),
+    }
+}
+
+/// Terminal ioctls name process groups, which the guest knows by virtual id.
+fn doTtyIoctl(c: *Ctx) Err!void {
+    const cmd: u32 = @truncate(c.arg(1));
+    switch (cmd) {
+        TIOCSPGRP => {
+            var b: [4]u8 = undefined;
+            try readMem(c.t.tid, c.arg(2), &b);
+            const real = c.tr.groupReal(std.mem.readInt(i32, &b, .little)) orelse return sys.fail(.SRCH);
+            std.mem.writeInt(i32, &b, real, .little);
+            c.setArg(2, try c.push(&b));
+        },
+        TIOCGPGRP, TIOCGSID => {
+            c.t.exit = if (cmd == TIOCGPGRP) .fix_tty_pgrp else .fix_tty_sid;
+            c.t.a0 = c.arg(2);
+        },
+        else => {},
     }
 }
 
@@ -2446,6 +2772,10 @@ fn routeOut(c: *Ctx, fam: u16, sa: []u8) Err!bool {
     if (ip4) |ip| {
         if (ip[0] == 10 and ip[1] == 88) {
             if (tr.spec.net_mode == .none) return sys.fail(.NETUNREACH);
+            if (tr.spec.host_gateway and ip[2] == 0 and ip[3] == 1) {
+                setLoopback(fam, sa);
+                return true;
+            }
             setPort(sa, try tr.peerPort(ip, port));
             setLoopback(fam, sa);
             return true;
@@ -2527,6 +2857,34 @@ fn doSendmsg(c: *Ctx) Err!void {
     }
 }
 
+/// So that stat() and unlink() still see something at the socket's path.
+fn keepSocketVisible(r: *Resolved) void {
+    const fd = sys.open(r.host.z(), sys.O_WRONLY | sys.O_CREAT, 0o600) catch -1;
+    if (fd >= 0) sys.close(fd);
+}
+
+/// Whether a socket file can be created in `dir`. It cannot when the path does
+/// not fit in an address, or for Android domains like `adb shell`, where
+/// SELinux forbids socket files altogether.
+fn socketFilesWork(dir: []const u8) bool {
+    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) return true;
+    const fd: i32 = @intCast(rc);
+    defer sys.close(fd);
+    var sa: linux.sockaddr.un = .{ .path = undefined };
+    @memset(&sa.path, 0);
+    // Room is left for the 16-digit names used for long paths.
+    if (dir.len + 18 >= sa.path.len) return false;
+    const name = std.fmt.bufPrint(&sa.path, "{s}/p{d}", .{ dir, linux.getpid() }) catch return false;
+    const e = linux.errno(linux.bind(fd, @ptrCast(&sa), @intCast(2 + name.len + 1)));
+    if (e == .SUCCESS or e == .ADDRINUSE) {
+        const path: [*:0]const u8 = @ptrCast(&sa.path);
+        sys.unlink(path) catch {};
+        return true;
+    }
+    return e != .ACCES and e != .PERM;
+}
+
 fn doSock(c: *Ctx, is_connect: bool) Err!void {
     const addr = c.arg(1);
     const len: usize = @truncate(c.arg(2));
@@ -2563,6 +2921,19 @@ fn doSock(c: *Ctx, is_connect: bool) Err!void {
             try vfs.prepareCreate(&r);
         }
 
+        if (c.tr.unix_abstract) {
+            if (is_connect and !r.exists) return sys.fail(.NOENT);
+            if (!is_connect) keepSocketVisible(&r);
+            var abs: [40]u8 = undefined;
+            std.mem.writeInt(u16, abs[0..2], linux.AF.UNIX, .little);
+            abs[2] = 0;
+            // Named after the file, so a socket on a shared volume is still shared.
+            const label = std.fmt.bufPrint(abs[3..], "pdock-{x}", .{std.hash.Wyhash.hash(0, r.host.slice())}) catch unreachable;
+            c.setArg(1, try c.push(abs[0 .. 3 + label.len]));
+            c.setArg(2, 3 + label.len);
+            return;
+        }
+
         // sun_path holds 108 bytes, and container paths are often longer.
         var host = r.host;
         if (host.len >= 100) {
@@ -2573,9 +2944,7 @@ fn doSock(c: *Ctx, is_connect: bool) Err!void {
             if (host.len >= 108) return sys.fail(.NAMETOOLONG);
             if (!is_connect) {
                 sys.unlink(host.z()) catch {};
-                // So that stat() and unlink() still see something at the path.
-                const fd = sys.open(r.host.z(), sys.O_WRONLY | sys.O_CREAT, 0o600) catch -1;
-                if (fd >= 0) sys.close(fd);
+                keepSocketVisible(&r);
             }
         }
         var out: [110]u8 = undefined;
