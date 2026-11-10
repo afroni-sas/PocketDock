@@ -68,6 +68,10 @@ const usage =
     \\      --build-arg KEY=VALUE          Set a build argument
     \\      --no-cache                     Run every step again
     \\  pull IMAGE          Download an image
+    \\  login REGISTRY -u USER [--password-stdin | -p PASSWORD]
+    \\                      For private images, e.g. ghcr.io or docker.io
+    \\  login --list        Registries with saved credentials
+    \\  logout REGISTRY
     \\  images              List images
     \\  prune               Delete build layers nothing uses any more
     \\  rmi IMAGE           Remove an image
@@ -154,6 +158,8 @@ pub fn main(init: std.process.Init) !void {
         .{ "inspect", cmdInspect },
         .{ "build", cmdBuild },
         .{ "pull", cmdPull },
+        .{ "login", cmdLogin },
+        .{ "logout", cmdLogout },
         .{ "images", cmdImages },
         .{ "rmi", cmdRmi },
         .{ "prune", cmdPrune },
@@ -244,6 +250,54 @@ fn cmdBuild(c: *Ctx, args: []const [:0]const u8) !void {
 
 fn cmdPrune(c: *Ctx, _: []const [:0]const u8) !void {
     sys.print("Removed {d} unused layers\n", .{try c.mgr.prune()});
+}
+
+fn cmdLogin(c: *Ctx, args: []const [:0]const u8) !void {
+    if (args.len == 1 and eql(args[0], "--list")) {
+        for (registry.loggedIn(c.a, c.store)) |h| sys.print("{s}\n", .{h});
+        return;
+    }
+    var host: ?[]const u8 = null;
+    var user: ?[]const u8 = null;
+    var password: ?[]const u8 = null;
+    var from_stdin = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const o: []const u8 = args[i];
+        if (eql(o, "-u") or eql(o, "--username")) {
+            i += 1;
+            if (i >= args.len) die("-u needs a value", .{});
+            user = args[i];
+        } else if (eql(o, "-p") or eql(o, "--password")) {
+            i += 1;
+            if (i >= args.len) die("-p needs a value", .{});
+            password = args[i];
+        } else if (eql(o, "--password-stdin")) {
+            from_stdin = true;
+        } else {
+            host = o;
+        }
+    }
+    const h = host orelse die("usage: pdock login REGISTRY -u USER --password-stdin", .{});
+    const u = user orelse die("pass -u USER", .{});
+    if (from_stdin) {
+        var buf: [4096]u8 = undefined;
+        var len: usize = 0;
+        while (len < buf.len) {
+            const n = try sys.read(0, buf[len..]);
+            if (n == 0) break;
+            len += n;
+        }
+        password = try c.a.dupe(u8, std.mem.trim(u8, buf[0..len], " \r\n"));
+    }
+    const p = password orelse die("pass --password-stdin or -p PASSWORD", .{});
+    try registry.saveCredentials(c.a, c.store, h, u, p);
+    sys.print("Saved credentials for {s}\n", .{registry.credentialKey(h)});
+}
+
+fn cmdLogout(c: *Ctx, args: []const [:0]const u8) !void {
+    if (args.len != 1) die("usage: pdock logout REGISTRY", .{});
+    if (!try registry.removeCredentials(c.a, c.store, args[0])) die("not logged in to {s}", .{args[0]});
 }
 
 fn cmdPull(c: *Ctx, args: []const [:0]const u8) !void {

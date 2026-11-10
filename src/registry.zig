@@ -67,19 +67,76 @@ const Sink = union(enum) {
     file: struct { fd: i32, hash: *Sha256, label: []const u8, total: u64, offset: u64 },
 };
 
+/// Where `pdock login` keeps credentials, in Docker's own format:
+/// {"auths": {"ghcr.io": {"auth": base64("user:password")}}}.
+const Auths = struct { auths: std.json.ArrayHashMap(struct { auth: []const u8 = "" }) = .{} };
+
+/// Docker Hub answers to several names; credentials are filed under one.
+pub fn credentialKey(host: []const u8) []const u8 {
+    if (std.mem.eql(u8, host, "registry-1.docker.io") or std.mem.eql(u8, host, "index.docker.io")) return "docker.io";
+    return host;
+}
+
+fn loadAuths(a: Allocator, store: Store) Auths {
+    const data = sys.readFileAlloc(a, store.path(&.{"auth.json"}), 1 << 20) catch return .{};
+    return std.json.parseFromSliceLeaky(Auths, a, data, .{ .ignore_unknown_fields = true }) catch .{};
+}
+
+/// The value of an `Authorization: Basic` header for `host`, if logged in.
+pub fn credentials(a: Allocator, store: Store, host: []const u8) ?[]const u8 {
+    const auths = loadAuths(a, store);
+    const entry = auths.auths.map.get(credentialKey(host)) orelse return null;
+    if (entry.auth.len == 0) return null;
+    return std.fmt.allocPrint(a, "Basic {s}", .{entry.auth}) catch null;
+}
+
+pub fn loggedIn(a: Allocator, store: Store) []const []const u8 {
+    return loadAuths(a, store).auths.map.keys();
+}
+
+pub fn saveCredentials(a: Allocator, store: Store, host: []const u8, user: []const u8, password: []const u8) !void {
+    var auths = loadAuths(a, store);
+    const plain = try std.fmt.allocPrint(a, "{s}:{s}", .{ user, password });
+    const enc = std.base64.standard.Encoder;
+    const encoded = try a.alloc(u8, enc.calcSize(plain.len));
+    _ = enc.encode(encoded, plain);
+    try auths.auths.map.put(a, try a.dupe(u8, credentialKey(host)), .{ .auth = encoded });
+    try sys.writeFileAtomic(store.path(&.{"auth.json"}), try std.json.Stringify.valueAlloc(a, auths, .{ .whitespace = .indent_2 }), 0o600);
+}
+
+pub fn removeCredentials(a: Allocator, store: Store, host: []const u8) !bool {
+    var auths = loadAuths(a, store);
+    if (!auths.auths.map.orderedRemove(credentialKey(host))) return false;
+    try sys.writeFileAtomic(store.path(&.{"auth.json"}), try std.json.Stringify.valueAlloc(a, auths, .{ .whitespace = .indent_2 }), 0o600);
+    return true;
+}
+
 const Client = struct {
     a: Allocator,
     http: *std.http.Client,
     ref: Ref,
     token: ?[]const u8 = null,
     www_auth: ?[]const u8 = null,
+    /// From `pdock login`: traded for a token, or sent as is to registries
+    /// that ask for Basic authentication.
+    basic: ?[]const u8 = null,
+    use_basic: bool = false,
 
     fn get(self: *Client, url: []const u8, accept: []const u8, sink: Sink) !std.http.Status {
-        var current = url;
-        // The bearer token is for the registry only. Blobs usually redirect
-        // to a signed CDN URL, which rejects (and must not see) the token.
         var auth: ?[]const u8 = null;
-        if (self.token) |t| auth = try std.fmt.allocPrint(self.a, "Bearer {s}", .{t});
+        if (self.use_basic) {
+            auth = self.basic;
+        } else if (self.token) |t| {
+            auth = try std.fmt.allocPrint(self.a, "Bearer {s}", .{t});
+        }
+        return self.getWith(url, accept, sink, auth);
+    }
+
+    fn getWith(self: *Client, url: []const u8, accept: []const u8, sink: Sink, first_auth: ?[]const u8) !std.http.Status {
+        var current = url;
+        // Credentials are for the registry only. Blobs usually redirect to a
+        // signed CDN URL, which rejects (and must not see) them.
+        var auth = first_auth;
         var hops: u32 = 0;
         while (hops < 6) : (hops += 1) {
             const next = try self.getOnce(current, accept, sink, auth);
@@ -186,6 +243,11 @@ const Client = struct {
 
     fn authenticate(self: *Client) !void {
         const header = self.www_auth orelse return error.RegistryAuthFailed;
+        if (std.ascii.startsWithIgnoreCase(header, "basic ")) {
+            if (self.basic == null or self.use_basic) return error.RegistryAuthFailed;
+            self.use_basic = true;
+            return;
+        }
         if (!std.ascii.startsWithIgnoreCase(header, "bearer ")) return error.RegistryAuthFailed;
         var realm: []const u8 = "";
         var service: []const u8 = "";
@@ -204,8 +266,11 @@ const Client = struct {
 
         var body: std.ArrayList(u8) = .empty;
         self.token = null;
-        const status = try self.get(url, "application/json", .{ .bytes = &body });
-        if (status != .ok) return error.RegistryAuthFailed;
+        const status = try self.getWith(url, "application/json", .{ .bytes = &body }, self.basic);
+        if (status != .ok) {
+            if (self.basic != null) sys.eprint("error: {s} refused the credentials of pdock login\n", .{self.ref.host});
+            return error.RegistryAuthFailed;
+        }
         const v = try std.json.parseFromSliceLeaky(std.json.Value, self.a, body.items, .{});
         const tok = v.object.get("token") orelse v.object.get("access_token") orelse return error.RegistryAuthFailed;
         self.token = tok.string;
@@ -363,7 +428,7 @@ pub fn pull(a: Allocator, gpa: Allocator, io: std.Io, store: Store, name: []cons
 
     var http: std.http.Client = .{ .allocator = gpa, .io = io };
     defer http.deinit();
-    var client: Client = .{ .a = a, .http = &http, .ref = ref };
+    var client: Client = .{ .a = a, .http = &http, .ref = ref, .basic = credentials(a, store, ref.host) };
 
     sys.print("Pulling {s} for linux/{s}\n", .{ ref.name, arch.oci_arch });
     var body = try client.fetch(try client.manifestUrl(ref.reference), accept_all);
@@ -421,4 +486,12 @@ pub fn pull(a: Allocator, gpa: Allocator, io: std.Io, store: Store, name: []cons
     try store.setRef(ref.name, id);
     sys.print("Done: {s}\n", .{id[0..12]});
     return id;
+}
+
+const testing = std.testing;
+
+test "Docker Hub credentials are filed under one name" {
+    try testing.expectEqualStrings("docker.io", credentialKey("registry-1.docker.io"));
+    try testing.expectEqualStrings("docker.io", credentialKey("index.docker.io"));
+    try testing.expectEqualStrings("ghcr.io", credentialKey("ghcr.io"));
 }
