@@ -419,9 +419,47 @@ fn pickPlatform(index: std.json.Value) ?[]const u8 {
     return null;
 }
 
+/// Holds the store's pull lock until `release`. Pulls share the blob files
+/// of their layers, and two pulls of one image share its rootfs.tmp: run at
+/// the same time, one deletes what the other is extracting.
+const PullLock = struct {
+    fd: i32,
+
+    fn take(store: Store) !PullLock {
+        var p = try sys.Path.of(store.path(&.{"pull.lock"}));
+        const fd = try sys.open(p.z(), sys.O_RDWR | sys.O_CREAT, 0o600);
+        if (sys.linux.errno(sys.linux.flock(fd, LOCK_EX | LOCK_NB)) == .AGAIN) {
+            sys.print("Waiting for another pull to finish\n", .{});
+            while (true) {
+                const rc = sys.linux.flock(fd, LOCK_EX);
+                if (sys.linux.errno(rc) == .INTR) continue;
+                _ = sys.ck(rc) catch |e| {
+                    sys.close(fd);
+                    return e;
+                };
+                break;
+            }
+        }
+        return .{ .fd = fd };
+    }
+
+    fn release(self: PullLock) void {
+        sys.close(self.fd);
+    }
+};
+
+const LOCK_EX = 2;
+const LOCK_NB = 4;
+
 /// Pulls `name` unless it is already stored. Returns the image id.
 pub fn pull(a: Allocator, gpa: Allocator, io: std.Io, store: Store, name: []const u8, force: bool) ![]const u8 {
     const ref = try parseRef(a, name);
+    if (!force) {
+        if (store.getRef(ref.name)) |id| return id;
+    }
+    const lock = try PullLock.take(store);
+    defer lock.release();
+    // Another pull may have brought it while this one waited.
     if (!force) {
         if (store.getRef(ref.name)) |id| return id;
     }
