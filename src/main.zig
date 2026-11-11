@@ -56,7 +56,8 @@ const usage =
     \\  restart NAME        Restart a container
     \\  rm [-f] NAME        Remove a container
     \\  ps [-a]             List containers
-    \\  stats               Live CPU, memory and process counts
+    \\  stats [--json]      Live CPU, memory and process counts; --json prints
+    \\                      one line per container with cumulative CPU time
     \\  logs [-f] [-t] [--tail N] NAME
     \\  exec [-it] [-e KEY=VALUE] NAME COMMAND...
     \\  inspect NAME        Print a container's configuration and state as JSON
@@ -518,7 +519,9 @@ fn shortImage(name: []const u8) []const u8 {
 
 fn cmdPs(c: *Ctx, args: []const [:0]const u8) !void {
     const all = args.len > 0 and (eql(args[0], "-a") or eql(args[0], "--all"));
-    sys.print("{s: <14}{s: <20}{s: <34}{s: <20}{s}\n", .{ "ID", "NAME", "IMAGE", "STATUS", "PORTS" });
+    const Row = struct { id: []const u8, name: []const u8, image: []const u8, status: []const u8, ports: []const u8 };
+    var rows: std.ArrayList(Row) = .empty;
+    var width: usize = 20;
     for (try c.mgr.listIds()) |id| {
         const cfg = c.mgr.loadConfig(id) catch continue;
         const st = c.mgr.loadState(id) catch continue;
@@ -541,8 +544,12 @@ fn cmdPs(c: *Ctx, args: []const [:0]const u8) !void {
             if (i > 0) try ports.appendSlice(c.a, ", ");
             try ports.print(c.a, "{d}->{d}", .{ p.host, p.container });
         }
-        const image = shortImage(cfg.image);
-        sys.print("{s: <14}{s: <20}{s: <34}{s: <20}{s}\n", .{ id, cfg.name, image, status, ports.items });
+        try rows.append(c.a, .{ .id = id, .name = cfg.name, .image = shortImage(cfg.image), .status = status, .ports = ports.items });
+        width = @max(width, cfg.name.len + 2);
+    }
+    sys.print("{s: <14}{s}{s: <34}{s: <20}{s}\n", .{ "ID", try pad(c.a, "NAME", width), "IMAGE", "STATUS", "PORTS" });
+    for (rows.items) |r| {
+        sys.print("{s: <14}{s}{s: <34}{s: <20}{s}\n", .{ r.id, try pad(c.a, r.name, width), r.image, r.status, r.ports });
     }
 }
 
@@ -553,7 +560,12 @@ fn human(a: Allocator, n: u64) []const u8 {
     return std.fmt.allocPrint(a, "{d}K", .{n / 1024}) catch "";
 }
 
-fn cmdStats(c: *Ctx, _: []const [:0]const u8) !void {
+fn cmdStats(c: *Ctx, args: []const [:0]const u8) !void {
+    var json = false;
+    for (args) |o| {
+        if (eql(o, "--json")) json = true else die("unknown option \"{s}\" for stats", .{o});
+    }
+    if (json) return statsJson(c);
     const Row = struct { id: []const u8, name: []const u8, limit: u64, shim: i32, first: container.Stats };
     var rows: std.ArrayList(Row) = .empty;
     for (try c.mgr.listIds()) |id| {
@@ -563,14 +575,43 @@ fn cmdStats(c: *Ctx, _: []const [:0]const u8) !void {
         const s = c.mgr.stats(id, st.shim_pid) catch continue;
         try rows.append(c.a, .{ .id = id, .name = cfg.name, .limit = cfg.memory, .shim = st.shim_pid, .first = s });
     }
-    sys.print("{s: <20}{s: <10}{s: <22}{s}\n", .{ "NAME", "CPU %", "MEM / LIMIT", "PIDS" });
+    var width: usize = 20;
+    for (rows.items) |r| width = @max(width, r.name.len + 2);
+    sys.print("{s}{s: <10}{s: <22}{s}\n", .{ try pad(c.a, "NAME", width), "CPU %", "MEM / LIMIT", "PIDS" });
     if (rows.items.len == 0) return;
     sys.sleepMs(1000);
     for (rows.items) |r| {
         const s = c.mgr.stats(r.id, r.shim) catch continue;
         const cpu = @as(f64, @floatFromInt(s.cpu_ms -| r.first.cpu_ms)) / 10.0;
         const mem = try std.fmt.allocPrint(c.a, "{s} / {s}", .{ human(c.a, s.memory), if (r.limit > 0) human(c.a, r.limit) else "-" });
-        sys.print("{s: <20}{d: <10.1}{s: <22}{d}\n", .{ r.name, cpu, mem, s.pids });
+        sys.print("{s}{d: <10.1}{s: <22}{d}\n", .{ try pad(c.a, r.name, width), cpu, mem, s.pids });
+    }
+}
+
+fn pad(a: Allocator, text: []const u8, width: usize) ![]const u8 {
+    const out = try a.alloc(u8, @max(width, text.len));
+    @memcpy(out[0..text.len], text);
+    @memset(out[text.len..], ' ');
+    return out;
+}
+
+/// One JSON object per running container, read at once: CPU time is
+/// cumulative, so a caller that samples twice gets the usage in between.
+fn statsJson(c: *Ctx) !void {
+    for (try c.mgr.listIds()) |id| {
+        const cfg = c.mgr.loadConfig(id) catch continue;
+        const st = c.mgr.loadState(id) catch continue;
+        if (!eql(st.status, "running")) continue;
+        const s = c.mgr.stats(id, st.shim_pid) catch continue;
+        const line = try std.json.Stringify.valueAlloc(c.a, .{
+            .id = id,
+            .name = cfg.name,
+            .pids = s.pids,
+            .memory = s.memory,
+            .memory_limit = cfg.memory,
+            .cpu_ms = s.cpu_ms,
+        }, .{});
+        sys.print("{s}\n", .{line});
     }
 }
 
