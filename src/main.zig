@@ -519,7 +519,9 @@ fn shortImage(name: []const u8) []const u8 {
 
 fn cmdPs(c: *Ctx, args: []const [:0]const u8) !void {
     const all = args.len > 0 and (eql(args[0], "-a") or eql(args[0], "--all"));
-    sys.print("{s: <14}{s: <20}{s: <34}{s: <20}{s}\n", .{ "ID", "NAME", "IMAGE", "STATUS", "PORTS" });
+    const Row = struct { id: []const u8, name: []const u8, image: []const u8, status: []const u8, ports: []const u8 };
+    var rows: std.ArrayList(Row) = .empty;
+    var width: usize = 20;
     for (try c.mgr.listIds()) |id| {
         const cfg = c.mgr.loadConfig(id) catch continue;
         const st = c.mgr.loadState(id) catch continue;
@@ -542,8 +544,12 @@ fn cmdPs(c: *Ctx, args: []const [:0]const u8) !void {
             if (i > 0) try ports.appendSlice(c.a, ", ");
             try ports.print(c.a, "{d}->{d}", .{ p.host, p.container });
         }
-        const image = shortImage(cfg.image);
-        sys.print("{s: <14}{s: <20}{s: <34}{s: <20}{s}\n", .{ id, cfg.name, image, status, ports.items });
+        try rows.append(c.a, .{ .id = id, .name = cfg.name, .image = shortImage(cfg.image), .status = status, .ports = ports.items });
+        width = @max(width, cfg.name.len + 2);
+    }
+    sys.print("{s: <14}{s}{s: <34}{s: <20}{s}\n", .{ "ID", try pad(c.a, "NAME", width), "IMAGE", "STATUS", "PORTS" });
+    for (rows.items) |r| {
+        sys.print("{s: <14}{s}{s: <34}{s: <20}{s}\n", .{ r.id, try pad(c.a, r.name, width), r.image, r.status, r.ports });
     }
 }
 
