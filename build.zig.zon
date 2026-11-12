@@ -1,7 +1,7 @@
 .{
     .name = .pocketdock,
     .fingerprint = 0x76d8a8c77f340e7f,
-    .version = "0.1.1",
+    .version = "0.2.0",
     .minimum_zig_version = "0.17.1",
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }
