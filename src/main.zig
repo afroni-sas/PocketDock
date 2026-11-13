@@ -16,7 +16,7 @@ const Store = @import("store.zig").Store;
 const Manager = container.Manager;
 const Allocator = std.mem.Allocator;
 
-const version = "0.2.0";
+const version = "0.2.1";
 
 const usage =
     \\PocketDock: run OCI containers on Android, without root.
