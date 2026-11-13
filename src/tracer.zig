@@ -1163,6 +1163,17 @@ pub const Tracer = struct {
         linux.exit_group(127);
     }
 
+    /// Says on the container's error output why a program cannot run. A
+    /// binary built for another processor otherwise fails with a bare
+    /// "exec format error", or with nothing at all as the first program.
+    fn sayWrongArch(self: *Tracer, path: []const u8, m: Machine) void {
+        var buf: [sys.PATH_MAX + 160]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "pdock: cannot run {s}: it is built for {s}, and this device is {s}\n", .{
+            path, machineName(m), machineName(.{ .id = arch.elf_machine }),
+        }) catch return;
+        _ = linux.write(self.spec.stderr_fd, msg.ptr, msg.len);
+    }
+
     fn pollControl(self: *Tracer) void {
         if (self.ctl_fd < 0) return;
         while (control.accept(self.ctl_fd)) |conn| {
@@ -2965,7 +2976,45 @@ fn doSock(c: *Ctx, is_connect: bool) Err!void {
     if (changed) c.setArg(1, try c.push(sa[0..n]));
 }
 
-const ElfKind = union(enum) { not_elf, wrong_arch, static, dynamic: Path };
+/// The processor an ELF binary is built for.
+const Machine = struct { id: u16, bits64: bool = true };
+
+/// A processor's name as images and build tools spell it.
+fn machineName(m: Machine) []const u8 {
+    if (!m.bits64) return switch (m.id) {
+        0x28 => "32-bit ARM (arm/v7)",
+        0x03 => "32-bit x86 (386)",
+        else => "a 32-bit processor",
+    };
+    return switch (m.id) {
+        0x3e => "x86_64 (amd64)",
+        0xb7 => "arm64 (aarch64)",
+        0xf3 => "RISC-V (riscv64)",
+        0x15 => "PowerPC (ppc64le)",
+        0x16 => "IBM Z (s390x)",
+        else => "another processor",
+    };
+}
+
+test "a binary for another processor is named" {
+    const other: u16 = if (arch.elf_machine == 0x3e) 0xb7 else 0x3e;
+    var eh: [64]u8 = @splat(0);
+    @memcpy(eh[0..4], "\x7fELF");
+    eh[4] = 2;
+    std.mem.writeInt(u16, eh[18..20], other, .little);
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrintSentinel(&name_buf, "/tmp/pdock-elf-test-{d}", .{linux.getpid()}, 0);
+    try sys.writeFileAtomic(name, &eh, 0o600);
+    defer sys.unlink(name.ptr) catch {};
+
+    const kind = try inspectElf(name.ptr);
+    try std.testing.expect(kind == .wrong_arch);
+    try std.testing.expectEqual(other, kind.wrong_arch.id);
+    try std.testing.expectEqualStrings(if (other == 0xb7) "arm64 (aarch64)" else "x86_64 (amd64)", machineName(kind.wrong_arch));
+    try std.testing.expectEqualStrings("32-bit ARM (arm/v7)", machineName(.{ .id = 0x28, .bits64 = false }));
+}
+
+const ElfKind = union(enum) { not_elf, wrong_arch: Machine, static, dynamic: Path };
 
 fn inspectElf(host: [*:0]const u8) Err!ElfKind {
     const fd = try sys.open(host, 0, 0);
@@ -2973,7 +3022,8 @@ fn inspectElf(host: [*:0]const u8) Err!ElfKind {
     var eh: [64]u8 = undefined;
     const n = try sys.readFull(fd, &eh);
     if (n < 64 or !std.mem.eql(u8, eh[0..4], "\x7fELF")) return .not_elf;
-    if (eh[4] != 2 or std.mem.readInt(u16, eh[18..20], .little) != arch.elf_machine) return .wrong_arch;
+    const machine: Machine = .{ .id = std.mem.readInt(u16, eh[18..20], .little), .bits64 = eh[4] == 2 };
+    if (!machine.bits64 or machine.id != arch.elf_machine) return .{ .wrong_arch = machine };
     const phoff = std.mem.readInt(u64, eh[32..40], .little);
     const phentsize = std.mem.readInt(u16, eh[54..56], .little);
     const phnum = std.mem.readInt(u16, eh[56..58], .little);
@@ -3076,7 +3126,11 @@ fn doExec(c: *Ctx, dirfd: i32, path_idx: usize, argv_idx: usize, flags: u64) Err
     }
 
     switch (kind) {
-        .not_elf, .wrong_arch => return sys.fail(.NOEXEC),
+        .not_elf => return sys.fail(.NOEXEC),
+        .wrong_arch => |m| {
+            c.tr.sayWrongArch(g.slice(), m);
+            return sys.fail(.NOEXEC);
+        },
         else => {},
     }
 
